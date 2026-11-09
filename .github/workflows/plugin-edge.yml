@@ -163,8 +163,10 @@ jobs:
             gh release edit edge --prerelease --notes "커밋 ${COMMIT:0:7}의 .lpg예요. $note"
           fi
           while IFS= read -r old; do
-            case "$old" in
-              *.lpg|SHA256SUMS.edge|SHA256SUMS-edge-*.txt)
-                gh release delete-asset "$release" "$old" -y ;;
-            esac
+            # 같은 실행이 남긴 해시 이름의 .lpg와 체크섬만 지워요.
+            # 릴리스 스크립트가 올린 고정 이름의 운영 서명 패키지는 보존해요.
+            if [[ "$old" == SHA256SUMS.edge || "$old" == SHA256SUMS-edge-*.txt ]] ||
+              [[ "$old" =~ -[0-9a-f]{12}-[0-9]+-[0-9]+(-ci)?\.lpg$ ]]; then
+              gh release delete-asset "$release" "$old" -y
+            fi
           done <<< "$existing"
