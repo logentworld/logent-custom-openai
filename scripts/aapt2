@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# AGP 9의 --옵션=값 형식을 공개 AOSP AAPT2의 분리 인자로 변환한다.
+set -euo pipefail
+: "${AAPT2_REAL:?AAPT2_REAL에 ARM64 AAPT2 실행 파일을 지정하세요.}"
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        --resource-path-shortening-map=*)
+            args+=(--resource-path-shortening-map "${arg#*=}")
+            ;;
+        *) args+=("$arg") ;;
+    esac
+done
+exec "$AAPT2_REAL" "${args[@]}"
