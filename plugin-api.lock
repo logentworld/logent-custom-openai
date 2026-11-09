@@ -1,6 +1,6 @@
 # Maven artifact와 이를 발행하는 API 소스 커밋을 함께 고정해요.
 group=com.sleepysoong.logent
 artifact=logent-plugin-api
-version=4.1.0
+version=4.2.0
 repository=https://maven.pkg.github.com/logentworld/plugin
-commit=7d9deab6a074d0072edb600f107a3e7d68356f65
+commit=2608e757b777708acfda528c7045a0da32a20743

@@ -1,6 +1,7 @@
 package com.sleepysoong.logent.customopenai
 
 import com.sleepysoong.logent.plugin.ApiMessage
+import com.sleepysoong.logent.plugin.PluginAiException
 import com.sleepysoong.logent.plugin.PluginAiProvider
 import com.sleepysoong.logent.plugin.PluginAiRequest
 import com.sleepysoong.logent.plugin.PluginHttpRequest
@@ -16,6 +17,45 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CustomOpenAiPluginTest {
+    @Test
+    fun `Go 대화 ID가 없거나 헤더를 오염시키면 HTTP 전송 전에 실패해요`() {
+        val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
+        for (conversationId in listOf(null, "", " ", "대화", "session\r\nInjected: value", "session\u007f")) {
+            val host = FakeHost(
+                values = mapOf(
+                    "endpoint" to "https://opencode.ai/inference/go/openai/v1/chat/completions",
+                    "api-key" to "secret",
+                ),
+                aiConversationId = conversationId,
+            )
+            val failure = runCatching { provider.open(host) }.exceptionOrNull()
+            assertTrue(failure is PluginAiException)
+            assertTrue(failure!!.message.orEmpty().contains("대화 ID"))
+            assertEquals(null, host.lastBody)
+        }
+    }
+
+    @Test
+    fun `Go와 비슷한 다른 호스트와 종량제 경로는 대화 ID 없이도 기존 요청을 보내요`() = runBlocking {
+        val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
+        for (endpoint in listOf(
+            "https://opencode.ai.example.com/inference/go/openai/v1/chat/completions",
+            "https://example.com/inference/go/openai/v1/chat/completions",
+            "https://opencode.ai/inference/openai/v1/chat/completions",
+            "https://opencode.ai/inference/gopher/openai/v1/chat/completions",
+            "https://example.com/v1/chat/completions?next=https://opencode.ai/inference/go/",
+        )) {
+            val host = FakeHost(mapOf("endpoint" to endpoint, "api-key" to "secret"))
+            val result = provider.open(host).complete(
+                PluginAiRequest(
+                    model = "demo-model",
+                    messages = listOf(ApiMessage("user", JsonPrimitive("안녕"))),
+                ),
+            )
+            assertEquals("완료", (result.message.content as JsonPrimitive).content)
+        }
+    }
+
     @Test
     fun `provider는 공용 services 계약으로 등록되고 응답과 도구 호출을 해석해요`() = runBlocking {
         val plugin = CustomOpenAiPlugin()
@@ -139,6 +179,7 @@ class CustomOpenAiPluginTest {
         private val streamLines: List<String> = emptyList(),
         private val streamBody: String = "",
         private val streamDelayMs: Long = 0,
+        override val aiConversationId: String? = null,
     ) : PluginHost {
         var lastBody: String? = null
         override val appVersion = "test"
