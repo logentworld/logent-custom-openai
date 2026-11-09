@@ -7,6 +7,8 @@ import com.sleepysoong.logent.plugin.PluginHttpRequest
 import com.sleepysoong.logent.plugin.PluginHttpResponse
 import com.sleepysoong.logent.plugin.PluginHost
 import com.sleepysoong.logent.plugin.ProcessResult
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
@@ -50,11 +52,17 @@ class CustomOpenAiPluginTest {
             ),
             streamLines = listOf(
                 """data: {"model":"demo","choices":[{"delta":{"reasoning_content":"생각"}}]}""",
+                "",
                 """data: {"choices":[{"delta":{"content":"안"}}]}""",
+                "",
                 """data: {"choices":[{"delta":{"content":"녕"}}]}""",
+                "",
                 """data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"demo","arguments":"{\"x\":"}}]}}]}""",
+                "",
                 """data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}""",
+                "",
                 "data: [DONE]",
+                "",
             ),
         )
         val reasoning = mutableListOf<String>()
@@ -75,9 +83,62 @@ class CustomOpenAiPluginTest {
         assertTrue(host.lastBody!!.contains("\"stream\":true"))
     }
 
+    @Test
+    fun `stream true를 무시한 JSON 응답은 일반 완료로 대체해요`() = runBlocking {
+        val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
+        val host = FakeHost(
+            mapOf("endpoint" to "https://example.com/v1/chat/completions", "api-key" to "secret"),
+            streamBody = """{"model":"demo","choices":[{"message":{"role":"assistant","content":"완료"}}]}""",
+        )
+        val result = provider.open(host).completeStreaming(
+            PluginAiRequest("demo-model", listOf(ApiMessage("user", JsonPrimitive("질문")))),
+            onEvent = {},
+        )
+        assertEquals("완료", (result.message.content as JsonPrimitive).content)
+    }
+
+    @Test
+    fun `완료 표시 없이 끊긴 스트림은 실패해요`() = runBlocking {
+        val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
+        val host = FakeHost(
+            mapOf("endpoint" to "https://example.com/v1/chat/completions", "api-key" to "secret"),
+            streamLines = listOf("""data: {"choices":[{"delta":{"content":"부분"}}]}""", ""),
+        )
+        val result = runCatching {
+            provider.open(host).completeStreaming(
+                PluginAiRequest("demo-model", listOf(ApiMessage("user", JsonPrimitive("질문")))),
+                onEvent = {},
+            )
+        }
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `세션 cancel은 진행 중인 스트림 요청을 취소해요`() = runBlocking {
+        val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
+        val session = provider.open(
+            FakeHost(
+                mapOf("endpoint" to "https://example.com/v1/chat/completions", "api-key" to "secret"),
+                streamDelayMs = 10_000,
+            ),
+        )
+        val job = launch {
+            session.completeStreaming(
+                PluginAiRequest("demo-model", listOf(ApiMessage("user", JsonPrimitive("질문")))),
+                onEvent = {},
+            )
+        }
+        delay(200)
+        session.cancel()
+        job.join()
+        assertTrue(job.isCancelled)
+    }
+
     private class FakeHost(
         private val values: Map<String, String>,
         private val streamLines: List<String> = emptyList(),
+        private val streamBody: String = "",
+        private val streamDelayMs: Long = 0,
     ) : PluginHost {
         var lastBody: String? = null
         override val appVersion = "test"
@@ -107,6 +168,8 @@ class CustomOpenAiPluginTest {
             onLine: (String) -> Unit,
         ): Result<PluginHttpResponse> {
             lastBody = request.body
+            if (streamDelayMs > 0) delay(streamDelayMs)
+            if (streamBody.isNotEmpty()) return Result.success(PluginHttpResponse(200, emptyMap(), streamBody))
             streamLines.forEach(onLine)
             return Result.success(PluginHttpResponse(200, emptyMap(), ""))
         }
