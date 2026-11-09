@@ -1,0 +1,165 @@
+name: 커밋마다 .lpg 빌드
+
+on:
+  push:
+    branches: [main, logent]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_ACTOR: ${{ github.actor }}
+      GITHUB_TOKEN: ${{ secrets.LOGENT_PLUGIN_API_TOKEN || github.token }}
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: API 잠금 커밋을 확인해요
+        id: api-pin
+        run: |
+          set -euo pipefail
+          pin="$(sed -n 's/^commit=//p' plugin-api.lock)"
+          [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || { echo 'plugin-api.lock의 commit이 올바르지 않아요.' >&2; exit 1; }
+          echo "commit=$pin" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: logentworld/plugin
+          ref: ${{ steps.api-pin.outputs.commit }}
+          token: ${{ secrets.LOGENT_PLUGIN_API_TOKEN || github.token }}
+          path: api-src
+          fetch-depth: 1
+      - name: API 체크아웃 커밋을 검증해요
+        env:
+          API_COMMIT: ${{ steps.api-pin.outputs.commit }}
+        run: '[[ "$(git -C api-src rev-parse HEAD)" == "$API_COMMIT" ]]'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Android SDK를 설치해요
+        run: |
+          sdk_tools="${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools"
+          if ! sdkmanager="$(find "$sdk_tools" -type f -name sdkmanager -print -quit)"; then
+            echo "Android SDK 도구 경로를 읽지 못했어요: $sdk_tools" >&2
+            exit 1
+          fi
+          if [[ -z "$sdkmanager" || ! -x "$sdkmanager" ]]; then
+            echo "실행 가능한 sdkmanager를 찾지 못했어요: $sdk_tools" >&2
+            exit 1
+          fi
+          if ! (set +o pipefail; yes | "$sdkmanager" --licenses >/dev/null); then
+            echo "Android SDK 라이선스를 승인하지 못했어요: $sdkmanager" >&2
+            exit 1
+          fi
+          if ! "$sdkmanager" 'platforms;android-37.0' 'build-tools;37.0.0'; then
+            echo "Android SDK 패키지를 설치하지 못했어요: $sdkmanager" >&2
+            exit 1
+          fi
+      - uses: gradle/actions/setup-gradle@v4
+      - name: API 계약을 로컬 Maven에 발행해요
+        working-directory: api-src
+        run: ./gradlew --no-daemon :plugin-api:publishToMavenLocal
+      - name: 테스트와 lint를 실행해요
+        run: ./scripts/test.sh -PlogentPluginApiMavenLocal=true
+      - name: 서명 키를 준비해요
+        id: signing
+        env:
+          CONTENT_SIGNING_KEY: ${{ secrets.LOGENT_CONTENT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/plugin-signing.pem"
+          public="$RUNNER_TEMP/plugin-signing-public.der"
+          umask 077
+          if [[ -n "${CONTENT_SIGNING_KEY:-}" ]]; then
+            printf '%s\n' "$CONTENT_SIGNING_KEY" > "$key"
+            echo 'signed=true' >> "$GITHUB_OUTPUT"
+          else
+            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+              -pkeyopt ec_param_enc:named_curve -out "$key"
+            echo 'signed=false' >> "$GITHUB_OUTPUT"
+          fi
+          openssl ec -in "$key" -pubout -outform DER -conv_form uncompressed \
+            -param_enc named_curve -out "$public" 2>/dev/null
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "public=$public" >> "$GITHUB_OUTPUT"
+      - name: 서명된 .lpg를 빌드해요
+        env:
+          LOGENT_PLUGIN_SIGNING_KEY_FILE: ${{ steps.signing.outputs.key }}
+          LOGENT_CONTENT_SIGNING_KEY_FILE: ${{ steps.signing.outputs.key }}
+          LOGENT_PLUGIN_PUBLIC_KEY_FILE: ${{ steps.signing.outputs.public }}
+          LOGENT_OPERATIONAL_SIGNING: ${{ steps.signing.outputs.signed }}
+        run: ./scripts/build.sh -PlogentPluginApiMavenLocal=true
+      - name: edge 릴리스에 .lpg를 올려요
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          COMMIT: ${{ github.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(build/dist/*.lpg)
+          [[ ${#assets[@]} -gt 0 ]] || { echo '.lpg가 없어요.' >&2; exit 1; }
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            release="$REF_NAME"
+          else
+            release=edge
+          fi
+          releases="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')"
+          if ! grep -Fxq -- "$release" <<< "$releases"; then
+            if [[ "$REF_TYPE" == "tag" ]]; then
+              gh release create "$release" --title "Logent plugin $release" --notes "태그 $release의 .lpg예요."
+            else
+              gh release create edge --prerelease --title 'Edge build' --notes '커밋마다 만드는 최신 .lpg예요.'
+            fi
+          fi
+          existing="$(gh release view "$release" --json assets --jq '.assets[].name')"
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          published=()
+          names=()
+          suffix="${COMMIT:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for asset in "${assets[@]}"; do
+            base="${asset##*/}"
+            name="${base%.lpg}-${suffix}.lpg"
+            if [[ "$SIGNED" != true ]]; then name="${name%.lpg}-ci.lpg"; fi
+            cp -- "$asset" "$staging/$name"
+            published+=("$staging/$name")
+            names+=("$name")
+          done
+          checksum="$staging/SHA256SUMS-edge-${suffix}.txt"
+          (cd "$staging" && sha256sum -- "${names[@]}" > "$checksum")
+          gh release upload "$release" "${published[@]}" "$checksum"
+          if [[ "$SIGNED" == true ]]; then
+            note='운영 서명 키로 서명했어요. 앱에 설치할 수 있어요.'
+          else
+            note='CI 테스트 서명이라 앱에 설치할 수 없어요. LOGENT_CONTENT_SIGNING_KEY를 설정하면 설치 가능한 패키지로 바뀌어요.'
+          fi
+          printf -v asset_list '\n- %s' "${names[@]}"
+          note+=$'\n\n이번 실행에서 올린 패키지예요:'
+          note+="$asset_list"
+          note+=$'\n체크섬 파일: '
+          note+="${checksum##*/}"
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            gh release edit "$release" --notes "태그 $release의 .lpg예요. $note"
+          else
+            gh release edit edge --prerelease --notes "커밋 ${COMMIT:0:7}의 .lpg예요. $note"
+          fi
+          while IFS= read -r old; do
+            case "$old" in
+              *.lpg|SHA256SUMS.edge|SHA256SUMS-edge-*.txt)
+                gh release delete-asset "$release" "$old" -y ;;
+            esac
+          done <<< "$existing"
