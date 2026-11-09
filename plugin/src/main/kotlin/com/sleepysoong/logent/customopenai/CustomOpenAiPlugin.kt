@@ -86,6 +86,16 @@ class CustomOpenAiPlugin : LogentPlugin {
         private val endpoint: String,
         private val apiKey: String,
     ) : PluginAiSession {
+        private val goSessionId: String? = if (isOpenCodeGoEndpoint(endpoint)) {
+            val conversationId = host.aiConversationId
+                ?: throw PluginAiException("OpenCode Go에는 실제 AI 대화 ID가 필요해요. 대화가 연결된 Logent에서 실행해 주세요.")
+            if (conversationId.isEmpty() || conversationId.any { it !in '!'..'~' }) {
+                throw PluginAiException("OpenCode Go 대화 ID가 안전한 HTTP 헤더 값이 아니에요.")
+            }
+            conversationId
+        } else {
+            null
+        }
         private val json = Json {
             ignoreUnknownKeys = true
             explicitNulls = false
@@ -149,6 +159,10 @@ class CustomOpenAiPlugin : LogentPlugin {
                     put("Authorization", "Bearer $apiKey")
                     put("Content-Type", "application/json")
                     put("Accept", if (stream) "text/event-stream" else "application/json")
+                    if (goSessionId != null) {
+                        put("x-opencode-session", goSessionId)
+                        put("User-Agent", "Logent/${host.appVersion}")
+                    }
                 },
                 body = requestBody(request, stream).toString(),
                 timeoutSeconds = 120,
@@ -316,6 +330,13 @@ class CustomOpenAiPlugin : LogentPlugin {
 
     companion object {
         private const val DEFAULT_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+        private fun isOpenCodeGoEndpoint(value: String): Boolean {
+            val uri = URI(value)
+            return uri.scheme.equals("https", ignoreCase = true) &&
+                uri.host.equals("opencode.ai", ignoreCase = true) &&
+                uri.rawPath.orEmpty().startsWith("/inference/go/")
+        }
+
         private fun isHttpsEndpoint(value: String): Boolean = runCatching {
             val uri = URI(value)
             uri.scheme.equals("https", ignoreCase = true) && !uri.host.isNullOrBlank() && uri.userInfo == null
