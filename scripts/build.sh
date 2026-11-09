@@ -41,7 +41,7 @@ import sys
 root = pathlib.Path(sys.argv[1])
 with (root / 'SHA256SUMS').open('w', encoding='ascii') as output:
     for name in sys.argv[2:]:
-        path = pathlib.Path(name)
+        path = root / name
         with path.open('rb') as asset:
             digest = hashlib.file_digest(asset, 'sha256').hexdigest()
         output.write(f'{digest}  {name}\n')
