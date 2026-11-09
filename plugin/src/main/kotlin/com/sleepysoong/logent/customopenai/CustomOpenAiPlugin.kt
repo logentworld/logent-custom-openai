@@ -17,6 +17,11 @@ import com.sleepysoong.logent.plugin.PluginSetting
 import com.sleepysoong.logent.plugin.PluginService
 import com.sleepysoong.logent.plugin.PluginSettingKind
 import com.sleepysoong.logent.plugin.ToolSpec
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -67,9 +72,11 @@ class CustomOpenAiPlugin : LogentPlugin {
 
         override fun open(host: PluginHost): PluginAiSession {
             val endpoint = host.setting("endpoint").orEmpty().trim().ifBlank { DEFAULT_ENDPOINT }
-            require(isHttpsEndpoint(endpoint)) { "endpoint는 사용자 정보가 없는 https:// 주소여야 해요." }
+            if (!isHttpsEndpoint(endpoint)) {
+                throw PluginAiException("endpoint는 사용자 정보가 없는 https:// 주소여야 해요.")
+            }
             val key = host.setting("api-key").orEmpty().trim()
-            require(key.isNotEmpty()) { "API 키를 먼저 저장해 주세요." }
+            if (key.isEmpty()) throw PluginAiException("API 키를 먼저 저장해 주세요.")
             return CustomSession(host, endpoint, key)
         }
     }
@@ -83,20 +90,54 @@ class CustomOpenAiPlugin : LogentPlugin {
             ignoreUnknownKeys = true
             explicitNulls = false
         }
+        private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        @Volatile
+        private var activeRequest: Job? = null
 
-        override suspend fun complete(request: PluginAiRequest): ChatResult {
-            val response = host.http(httpRequest(request, stream = false)).getOrThrow()
-            ensureSuccess(response)
-            return parseCompletion(response.body)
+        override suspend fun complete(request: PluginAiRequest): ChatResult = runRequest {
+            completeOnce(request)
         }
 
         override suspend fun completeStreaming(
             request: PluginAiRequest,
             onEvent: (PluginAiStreamEvent) -> Unit,
+        ): ChatResult = runRequest {
+            completeStreamingOnce(request, onEvent)
+        }
+
+        override fun cancel() {
+            activeRequest?.cancel()
+        }
+
+        private suspend fun <T> runRequest(block: suspend () -> T): T {
+            val request = scope.async { block() }
+            activeRequest = request
+            return try {
+                request.await()
+            } finally {
+                if (activeRequest === request) activeRequest = null
+            }
+        }
+
+        private suspend fun completeOnce(request: PluginAiRequest): ChatResult {
+            val response = host.http(httpRequest(request, stream = false)).getOrThrow()
+            ensureSuccess(response)
+            return parseCompletion(response.body)
+        }
+
+        private suspend fun completeStreamingOnce(
+            request: PluginAiRequest,
+            onEvent: (PluginAiStreamEvent) -> Unit,
         ): ChatResult {
             val state = StreamState(json, onEvent)
-            val response = host.httpStream(httpRequest(request, stream = true)) { state.accept(it) }.getOrThrow()
+            val result = host.httpStream(httpRequest(request, stream = true)) { state.accept(it) }
+            if (result.exceptionOrNull() is UnsupportedOperationException) {
+                return completeOnce(request)
+            }
+            val response = result.getOrThrow()
             ensureSuccess(response)
+            // 일부 OpenAI 호환 서버는 stream:true를 무시하고 일반 JSON을 돌려줘요.
+            if (!state.hasData && response.body.isNotBlank()) return parseCompletion(response.body)
             return state.finish()
         }
 
@@ -178,48 +219,30 @@ class CustomOpenAiPlugin : LogentPlugin {
     ) {
         private val text = StringBuilder()
         private val calls = sortedMapOf<Int, CallBuilder>()
+        private val data = StringBuilder()
         private var sawData = false
+        private var finished = false
         private var inputTokens: Int? = null
         private var outputTokens: Int? = null
         private var responseModel: String? = null
 
+        val hasData: Boolean get() = sawData || text.isNotEmpty() || calls.isNotEmpty()
+
         fun accept(line: String) {
+            if (line.isBlank()) {
+                flush()
+                return
+            }
             if (!line.startsWith("data:")) return
-            val payload = line.removePrefix("data:").trim()
-            if (payload == "[DONE]") return
-            if (payload.isEmpty()) return
-            sawData = true
-            val root = runCatching { json.parseToJsonElement(payload).jsonObject }
-                .getOrElse { throw PluginAiException("OpenAI 호환 스트림을 해석하지 못했어요.", cause = it) }
-            root["error"]?.let { throw PluginAiException((it as? JsonObject)?.get("message")?.jsonPrimitive?.content ?: "스트림 오류") }
-            responseModel = root["model"]?.jsonPrimitive?.takeIf { it.isString }?.content ?: responseModel
-            (root["usage"] as? JsonObject)?.let { usage ->
-                inputTokens = usage["prompt_tokens"]?.jsonPrimitive?.content?.toIntOrNull() ?: inputTokens
-                outputTokens = usage["completion_tokens"]?.jsonPrimitive?.content?.toIntOrNull() ?: outputTokens
-            }
-            val delta = root["choices"]?.jsonArray?.firstOrNull()?.jsonObject?.get("delta") as? JsonObject ?: return
-            delta["content"]?.jsonPrimitive?.takeIf { it.isString }?.content?.takeIf { it.isNotEmpty() }?.let {
-                text.append(it)
-                onEvent(PluginAiStreamEvent.Content(it))
-            }
-            val reasoning = delta["reasoning"]?.jsonPrimitive?.takeIf { it.isString }?.content
-                ?: delta["reasoning_content"]?.jsonPrimitive?.takeIf { it.isString }?.content
-            if (!reasoning.isNullOrEmpty()) onEvent(PluginAiStreamEvent.Reasoning(reasoning))
-            (delta["tool_calls"] as? JsonArray)?.forEach { element ->
-                val call = element as? JsonObject ?: return@forEach
-                val index = call["index"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
-                val builder = calls.getOrPut(index) { CallBuilder() }
-                call["id"]?.jsonPrimitive?.takeIf { it.isString }?.content?.let { builder.id = it }
-                val function = call["function"] as? JsonObject ?: return@forEach
-                function["name"]?.jsonPrimitive?.takeIf { it.isString }?.content?.let { builder.name.append(it) }
-                function["arguments"]?.jsonPrimitive?.takeIf { it.isString }?.content?.let { builder.arguments.append(it) }
-            }
+            if (data.isNotEmpty()) data.append('\n')
+            data.append(line.removePrefix("data:").trimStart())
+            if (data.toString().trim() == "[DONE]") flush()
         }
 
         fun finish(): ChatResult {
-            if (!sawData && text.isEmpty() && calls.isEmpty()) {
-                throw PluginAiException("OpenAI 호환 스트림에 응답 데이터가 없어요.")
-            }
+            flush()
+            if (!finished) throw PluginAiException("OpenAI 호환 스트림이 완료되기 전에 끊겼어요.")
+            if (!hasData) throw PluginAiException("OpenAI 호환 스트림에 응답 데이터가 없어요.")
             val content = text.toString()
             val toolCalls = calls.map { (index, builder) ->
                 ApiToolCall(
@@ -240,6 +263,49 @@ class CustomOpenAiPlugin : LogentPlugin {
                 responseModel = responseModel,
             )
         }
+
+        private fun flush() {
+            val payload = data.toString().trim()
+            data.setLength(0)
+            if (payload.isEmpty()) return
+            if (payload == "[DONE]") {
+                finished = true
+                return
+            }
+            sawData = true
+            val root = runCatching { json.parseToJsonElement(payload).jsonObject }
+                .getOrElse { throw PluginAiException("OpenAI 호환 스트림을 해석하지 못했어요.", cause = it) }
+            root["error"]?.let { throw PluginAiException(streamError(it)) }
+            responseModel = root["model"]?.jsonPrimitive?.takeIf { it.isString }?.content ?: responseModel
+            (root["usage"] as? JsonObject)?.let { usage ->
+                inputTokens = usage["prompt_tokens"]?.jsonPrimitive?.content?.toIntOrNull() ?: inputTokens
+                outputTokens = usage["completion_tokens"]?.jsonPrimitive?.content?.toIntOrNull() ?: outputTokens
+            }
+            val choice = root["choices"]?.jsonArray?.firstOrNull()?.jsonObject
+            if (choice?.get("finish_reason")?.jsonPrimitive?.takeIf { it.isString }?.content != null) finished = true
+            val delta = choice?.get("delta") as? JsonObject ?: return
+            delta["content"]?.jsonPrimitive?.takeIf { it.isString }?.content?.takeIf { it.isNotEmpty() }?.let {
+                text.append(it)
+                onEvent(PluginAiStreamEvent.Content(it))
+            }
+            val reasoning = delta["reasoning"]?.jsonPrimitive?.takeIf { it.isString }?.content
+                ?: delta["reasoning_content"]?.jsonPrimitive?.takeIf { it.isString }?.content
+            if (!reasoning.isNullOrEmpty()) onEvent(PluginAiStreamEvent.Reasoning(reasoning))
+            (delta["tool_calls"] as? JsonArray)?.forEach { element ->
+                val call = element as? JsonObject ?: return@forEach
+                val index = call["index"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
+                val builder = calls.getOrPut(index) { CallBuilder() }
+                call["id"]?.jsonPrimitive?.takeIf { it.isString }?.content?.let { builder.id = it }
+                val function = call["function"] as? JsonObject ?: return@forEach
+                function["name"]?.jsonPrimitive?.takeIf { it.isString }?.content?.let { builder.name.append(it) }
+                function["arguments"]?.jsonPrimitive?.takeIf { it.isString }?.content?.let { builder.arguments.append(it) }
+            }
+        }
+
+        private fun streamError(element: kotlinx.serialization.json.JsonElement): String =
+            (element as? JsonObject)?.get("message")?.jsonPrimitive?.takeIf { it.isString }?.content
+                ?: (element as? JsonPrimitive)?.takeIf { it.isString }?.content
+                ?: "OpenAI 호환 스트림이 오류를 반환했어요."
 
         private class CallBuilder {
             var id: String? = null
