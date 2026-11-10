@@ -49,7 +49,7 @@ class CustomOpenAiPlugin : LogentPlugin {
         PluginSetting(
             key = "endpoint",
             title = "Chat Completions endpoint",
-            description = "OpenAI 호환 HTTPS 주소예요. 예: https://api.openai.com/v1/chat/completions · OpenCode Go는 https://opencode.ai/inference/go/openai/v1/chat/completions 또는 https://opencode.ai/zen/go/v1/chat/completions를 써요.",
+            description = "OpenAI 호환 HTTPS 주소예요. base(.../v1) 또는 전체 Chat Completions 주소를 넣어요. OpenCode Go는 https://opencode.ai/zen/go/v1 또는 https://opencode.ai/inference/go를 써요.",
             kind = PluginSettingKind.TEXT,
             defaultValue = DEFAULT_ENDPOINT,
         ),
@@ -71,7 +71,9 @@ class CustomOpenAiPlugin : LogentPlugin {
         override val apiKeySetting = "api-key"
 
         override fun open(host: PluginHost): PluginAiSession {
-            val endpoint = host.setting("endpoint").orEmpty().trim().ifBlank { DEFAULT_ENDPOINT }
+            val endpoint = normalizeEndpoint(
+                host.setting("endpoint").orEmpty().trim().ifBlank { DEFAULT_ENDPOINT },
+            )
             if (!isHttpsEndpoint(endpoint)) {
                 throw PluginAiException("endpoint는 사용자 정보가 없는 https:// 주소여야 해요.")
             }
@@ -356,12 +358,34 @@ class CustomOpenAiPlugin : LogentPlugin {
             return path.startsWith("/inference/go/") || path.startsWith("/zen/go/")
         }
 
+        /**
+         * 다른 하네스가 쓰는 base URL을 Chat Completions 전체 주소로 맞춰요.
+         *
+         * 이미 전체 주소인 값과 쿼리가 붙은 값은 건드리지 않아요.
+         */
+        private fun normalizeEndpoint(value: String): String {
+            val uri = runCatching { URI(value) }.getOrNull() ?: return value
+            if (uri.rawQuery != null) return value
+            val path = uri.rawPath.orEmpty().trimEnd('/')
+            val suffix = when {
+                uri.host.equals("opencode.ai", ignoreCase = true) && path == "/inference/go" ->
+                    "/openai/v1/chat/completions"
+                uri.host.equals("opencode.ai", ignoreCase = true) && path == "/zen/go" ->
+                    "/v1/chat/completions"
+                path.endsWith("/v1") -> "/chat/completions"
+                else -> return value
+            }
+            return value.substringBefore('?').trimEnd('/') + suffix
+        }
+
         /** OpenCode의 일반 과금 경로예요. Go 구독은 이 경로에 적용되지 않아요. */
         private fun isOpenCodePayAsYouGoEndpoint(value: String): Boolean {
             val uri = URI(value)
+            val path = uri.rawPath.orEmpty()
             return uri.scheme.equals("https", ignoreCase = true) &&
                 uri.host.equals("opencode.ai", ignoreCase = true) &&
-                uri.rawPath.orEmpty().startsWith("/inference/")
+                path.startsWith("/inference/") &&
+                !path.startsWith("/inference/go/")
         }
 
         private fun isHttpsEndpoint(value: String): Boolean = runCatching {

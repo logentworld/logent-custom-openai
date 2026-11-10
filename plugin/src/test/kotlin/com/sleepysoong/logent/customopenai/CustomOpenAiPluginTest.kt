@@ -82,6 +82,25 @@ class CustomOpenAiPluginTest {
     }
 
     @Test
+    fun `다른 하네스가 쓰는 base URL도 Chat Completions 주소로 맞춰요`() = runBlocking {
+        val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
+        val cases = mapOf(
+            "https://opencode.ai/zen/go/v1" to "https://opencode.ai/zen/go/v1/chat/completions",
+            "https://opencode.ai/inference/go" to "https://opencode.ai/inference/go/openai/v1/chat/completions",
+            "https://api.example.com/v1" to "https://api.example.com/v1/chat/completions",
+            "https://api.example.com/v1/chat/completions" to "https://api.example.com/v1/chat/completions",
+        )
+        for ((configured, expected) in cases) {
+            val host = FakeHost(
+                mapOf("endpoint" to configured, "api-key" to "secret"),
+                aiConversationId = "session-base",
+            )
+            provider.open(host).complete(PluginAiRequest("deepseek-v4.1-flash", emptyList()))
+            assertEquals(expected, host.lastUrl)
+        }
+    }
+
+    @Test
     fun `Zen Go 경로도 대화 헤더와 리다이렉트 보호를 선언해요`() = runBlocking {
         val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
         val host = FakeHost(
@@ -228,6 +247,7 @@ class CustomOpenAiPluginTest {
         override val aiConversationId: String? = null,
     ) : PluginHost {
         var lastBody: String? = null
+        var lastUrl: String = ""
         var lastHeaders: Map<String, String> = emptyMap()
         var lastProtectedHeaders: Set<String> = emptySet()
         override val appVersion = "test"
@@ -267,6 +287,7 @@ class CustomOpenAiPluginTest {
 
         private fun respond(request: PluginHttpRequest): Result<PluginHttpResponse> {
             lastBody = request.body
+            lastUrl = request.url
             lastHeaders = request.headers
             return Result.success(
                 PluginHttpResponse(
@@ -282,6 +303,7 @@ class CustomOpenAiPluginTest {
             onLine: (String) -> Unit,
         ): Result<PluginHttpResponse> {
             lastBody = request.body
+            lastUrl = request.url
             lastHeaders = request.headers
             if (streamDelayMs > 0) delay(streamDelayMs)
             if (streamBody.isNotEmpty()) return Result.success(PluginHttpResponse(200, emptyMap(), streamBody))
