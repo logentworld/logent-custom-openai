@@ -20,6 +20,8 @@ OpenAI 호환 Chat Completions 서버를 Logent의 AI 백엔드로 등록하는 
 - 모델은 `opencode-go/` 같은 접두사 없이 `deepseek-v4.1-flash`·`glm-5.3`·`kimi-k3`처럼 Go가 제공하는 ID를 입력해요.
 - 플러그인이 대화별 고정 `x-opencode-session`과 자체 `User-Agent`를 자동으로 보내요. 실제 대화 ID가 없거나 안전하지 않으면 전송 전에 오류를 알려줘요. 다른 endpoint에는 이 세션 헤더를 보내지 않아요.
 - 다른 출처로 리다이렉트되면 대화 ID 헤더를 넘기지 않도록 플러그인이 API 4.3의 `protectedHeaders`로 보호를 선언해요.
+- 일반 `/inference/openai/...` 경로는 Go 구독이 아니라 계정 잔액으로 과금돼요. 잔액이 없으면 `402 Insufficient account funds`가 나며, 플러그인이 위의 Go 경로 안내를 함께 표시해요.
+- Go에 없는 모델은 `410 ModelDeprecated`처럼 서버가 안내하는 오류로 실패해요. 모델을 바꾸지 않고 자동 우회하지 않아요.
 - Console의 API 변환을 이용하므로 Chat Completions를 유지하며, 일반 종량제 경로나 다른 모델로 자동 전환하지 않아요.
 
 [공식 Go 안내](https://opencode.ai/docs/console/go)와 [하네스·세션 안내](https://opencode.ai/docs/console/harnesses#sessions)를 참고해요.
