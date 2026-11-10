@@ -49,7 +49,7 @@ class CustomOpenAiPlugin : LogentPlugin {
         PluginSetting(
             key = "endpoint",
             title = "Chat Completions endpoint",
-            description = "OpenAI 호환 HTTPS 주소예요. 예: https://api.openai.com/v1/chat/completions",
+            description = "OpenAI 호환 HTTPS 주소예요. 예: https://api.openai.com/v1/chat/completions · OpenCode Go는 https://opencode.ai/inference/go/openai/v1/chat/completions 또는 https://opencode.ai/zen/go/v1/chat/completions를 써요.",
             kind = PluginSettingKind.TEXT,
             defaultValue = DEFAULT_ENDPOINT,
         ),
@@ -190,7 +190,18 @@ class CustomOpenAiPlugin : LogentPlugin {
         private fun ensureSuccess(response: PluginHttpResponse) {
             if (response.status in 200..299) return
             val message = errorMessage(response.body) ?: "OpenAI 호환 서버가 ${response.status}로 응답했어요."
-            throw PluginAiException(message, response.status, response.headers["retry-after"]?.toLongOrNull())
+            val hint = if (response.status == 402 &&
+                message.contains("Insufficient account funds", ignoreCase = true) &&
+                isOpenCodePayAsYouGoEndpoint(endpoint)
+            ) {
+                " OpenCode Go 구독은 일반 /inference 경로가 아니라 " +
+                    "https://opencode.ai/inference/go/openai/v1/chat/completions 또는 " +
+                    "https://opencode.ai/zen/go/v1/chat/completions 에서만 적용돼요. " +
+                    "플러그인 설정의 endpoint를 Go 주소로 바꿔 주세요."
+            } else {
+                ""
+            }
+            throw PluginAiException(message + hint, response.status, response.headers["retry-after"]?.toLongOrNull())
         }
 
         private fun parseCompletion(body: String): ChatResult {
@@ -343,6 +354,14 @@ class CustomOpenAiPlugin : LogentPlugin {
             }
             val path = uri.rawPath.orEmpty()
             return path.startsWith("/inference/go/") || path.startsWith("/zen/go/")
+        }
+
+        /** OpenCode의 일반 과금 경로예요. Go 구독은 이 경로에 적용되지 않아요. */
+        private fun isOpenCodePayAsYouGoEndpoint(value: String): Boolean {
+            val uri = URI(value)
+            return uri.scheme.equals("https", ignoreCase = true) &&
+                uri.host.equals("opencode.ai", ignoreCase = true) &&
+                uri.rawPath.orEmpty().startsWith("/inference/")
         }
 
         private fun isHttpsEndpoint(value: String): Boolean = runCatching {

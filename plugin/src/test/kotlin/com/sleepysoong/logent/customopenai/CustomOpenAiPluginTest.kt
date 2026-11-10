@@ -59,6 +59,29 @@ class CustomOpenAiPluginTest {
     }
 
     @Test
+    fun `과금 경로의 잔액 부족 오류는 Go 경로 안내를 붙여요`() = runBlocking {
+        val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
+        val host = FakeHost(
+            mapOf(
+                "endpoint" to "https://opencode.ai/inference/openai/v1/chat/completions",
+                "api-key" to "secret",
+            ),
+            httpStatus = 402,
+            httpBody = """{"error":{"type":"invalid_request_error","message":"Insufficient account funds"}}""",
+        )
+        val failure = runCatching {
+            provider.open(host).complete(
+                PluginAiRequest("deepseek-v4.1-flash", listOf(ApiMessage("user", JsonPrimitive("hi")))),
+            )
+        }.exceptionOrNull()
+        assertTrue(failure is PluginAiException)
+        val message = (failure as? PluginAiException)?.message.orEmpty()
+        assertTrue(message, message.contains("Insufficient account funds"))
+        assertTrue(message, message.contains("/inference/go/openai/v1/chat/completions"))
+        assertTrue(message, message.contains("/zen/go/v1/chat/completions"))
+    }
+
+    @Test
     fun `Zen Go 경로도 대화 헤더와 리다이렉트 보호를 선언해요`() = runBlocking {
         val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
         val host = FakeHost(
@@ -200,6 +223,8 @@ class CustomOpenAiPluginTest {
         private val streamLines: List<String> = emptyList(),
         private val streamBody: String = "",
         private val streamDelayMs: Long = 0,
+        private val httpStatus: Int = 200,
+        private val httpBody: String? = null,
         override val aiConversationId: String? = null,
     ) : PluginHost {
         var lastBody: String? = null
@@ -245,9 +270,9 @@ class CustomOpenAiPluginTest {
             lastHeaders = request.headers
             return Result.success(
                 PluginHttpResponse(
-                    200,
+                    httpStatus,
                     emptyMap(),
-                    """{"model":"demo","choices":[{"message":{"role":"assistant","content":"완료","tool_calls":[{"id":"call-1","type":"function","function":{"name":"demo","arguments":"{}"}}]}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}""",
+                    httpBody ?: """{"model":"demo","choices":[{"message":{"role":"assistant","content":"완료","tool_calls":[{"id":"call-1","type":"function","function":{"name":"demo","arguments":"{}"}}]}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}""",
                 ),
             )
         }
