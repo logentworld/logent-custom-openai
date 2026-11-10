@@ -96,6 +96,9 @@ class CustomOpenAiPlugin : LogentPlugin {
         } else {
             null
         }
+        /** 다른 출처로 리다이렉트될 때 대화 식별자를 넘기지 않도록 호스트에 직접 알려요. */
+        private val protectedHeaders: Set<String> =
+            if (goSessionId == null) emptySet() else setOf(SESSION_HEADER)
         private val json = Json {
             ignoreUnknownKeys = true
             explicitNulls = false
@@ -130,7 +133,7 @@ class CustomOpenAiPlugin : LogentPlugin {
         }
 
         private suspend fun completeOnce(request: PluginAiRequest): ChatResult {
-            val response = host.http(httpRequest(request, stream = false)).getOrThrow()
+            val response = host.http(httpRequest(request, stream = false), protectedHeaders).getOrThrow()
             ensureSuccess(response)
             return parseCompletion(response.body)
         }
@@ -140,7 +143,7 @@ class CustomOpenAiPlugin : LogentPlugin {
             onEvent: (PluginAiStreamEvent) -> Unit,
         ): ChatResult {
             val state = StreamState(json, onEvent)
-            val result = host.httpStream(httpRequest(request, stream = true)) { state.accept(it) }
+            val result = host.httpStream(httpRequest(request, stream = true), { state.accept(it) }, protectedHeaders)
             if (result.exceptionOrNull() is UnsupportedOperationException) {
                 return completeOnce(request)
             }
@@ -160,7 +163,7 @@ class CustomOpenAiPlugin : LogentPlugin {
                     put("Content-Type", "application/json")
                     put("Accept", if (stream) "text/event-stream" else "application/json")
                     if (goSessionId != null) {
-                        put("x-opencode-session", goSessionId)
+                        put(SESSION_HEADER, goSessionId)
                         put("User-Agent", "Logent/${host.appVersion}")
                     }
                 },
@@ -330,11 +333,16 @@ class CustomOpenAiPlugin : LogentPlugin {
 
     companion object {
         private const val DEFAULT_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+        private const val SESSION_HEADER = "x-opencode-session"
         private fun isOpenCodeGoEndpoint(value: String): Boolean {
             val uri = URI(value)
-            return uri.scheme.equals("https", ignoreCase = true) &&
-                uri.host.equals("opencode.ai", ignoreCase = true) &&
-                uri.rawPath.orEmpty().startsWith("/inference/go/")
+            if (!uri.scheme.equals("https", ignoreCase = true) ||
+                !uri.host.equals("opencode.ai", ignoreCase = true)
+            ) {
+                return false
+            }
+            val path = uri.rawPath.orEmpty()
+            return path.startsWith("/inference/go/") || path.startsWith("/zen/go/")
         }
 
         private fun isHttpsEndpoint(value: String): Boolean = runCatching {
