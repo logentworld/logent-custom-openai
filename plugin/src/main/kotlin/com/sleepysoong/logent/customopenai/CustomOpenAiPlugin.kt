@@ -14,14 +14,11 @@ import com.sleepysoong.logent.plugin.PluginHost
 import com.sleepysoong.logent.plugin.PluginHttpRequest
 import com.sleepysoong.logent.plugin.PluginHttpResponse
 import com.sleepysoong.logent.plugin.PluginSetting
+import com.sleepysoong.logent.plugin.PluginSettingGroup
 import com.sleepysoong.logent.plugin.PluginService
 import com.sleepysoong.logent.plugin.PluginSettingKind
 import com.sleepysoong.logent.plugin.ToolSpec
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -36,58 +33,87 @@ import kotlinx.serialization.json.put
 import java.net.URI
 
 /**
- * 사용자가 endpoint·키·모델을 지정하는 OpenAI 호환 Chat Completions 백엔드예요.
- *
- * 도구·이미지·사고 과정·SSE를 공용 API 계약으로 전달하고, 인증 키는 플러그인 설정에서만 읽어요.
+ * 여러 OpenAI 호환·NVIDIA NIM·Codex 구독 프로필을 AI 제공자로 기여해요.
+ * 인증과 모델은 프로필이 소유하며 모델 화면에서 키를 다시 입력하지 않아요.
  */
 class CustomOpenAiPlugin : LogentPlugin {
     override val id = "com.sleepysoong.logent.custom-openai"
-    override val name = "사용자 지정 OpenAI"
+    override val name = "AI 제공자"
     override val version = BuildConfig.PLUGIN_VERSION
 
-    override fun settings() = listOf(
-        PluginSetting(
-            key = "endpoint",
-            title = "Chat Completions endpoint",
-            description = "OpenAI 호환 HTTPS 주소예요. base(.../v1) 또는 전체 Chat Completions 주소를 넣어요. OpenCode Go는 https://opencode.ai/zen/go/v1 또는 https://opencode.ai/inference/go를 써요.",
-            kind = PluginSettingKind.TEXT,
-            defaultValue = DEFAULT_ENDPOINT,
-        ),
-        PluginSetting(
-            key = "api-key",
-            title = "API 키",
-            description = "플러그인 전용 저장소에만 보관하고 화면·로그·프롬프트에 내보내지 않아요.",
-            kind = PluginSettingKind.SECRET,
+    private val codexAuth = ConcurrentHashMap<String, CodexAuthStore>()
+
+    override fun settingGroups() = listOf(
+        PluginSettingGroup(
+            key = PROVIDERS_GROUP,
+            title = "제공자",
+            description = "서로 다른 서버·계정·모델을 프로필별로 관리해요.",
+            itemTitleKey = "name",
+            addLabel = "제공자 추가",
+            fields = listOf(
+                PluginSetting("name", "이름", defaultValue = "AI 제공자"),
+                PluginSetting(
+                    "type", "종류",
+                    kind = PluginSettingKind.SELECT,
+                    defaultValue = OPENAI_TYPE,
+                    options = listOf(OPENAI_TYPE, NVIDIA_TYPE, CODEX_TYPE),
+                ),
+                PluginSetting(
+                    "endpoint", "Endpoint",
+                    description = "HTTPS base 또는 전체 요청 주소예요. NVIDIA·Codex에서는 비우거나 OpenAI 기본값을 두면 종류별 기본 주소를 써요.",
+                    defaultValue = OPENAI_ENDPOINT,
+                ),
+                PluginSetting(
+                    "model", "모델",
+                    description = "이 프로필이 실행할 모델 ID예요. NVIDIA·Codex에서는 비우거나 OpenAI 기본값을 두면 종류별 기본 모델을 써요.",
+                    defaultValue = OPENAI_MODEL,
+                ),
+                PluginSetting(
+                    "api-key", "API 키",
+                    description = "선택 입력이에요. 키 없는 OpenAI 호환 서버는 인증 헤더를 보내지 않아요. NVIDIA는 키가 필요해요.",
+                    kind = PluginSettingKind.SECRET,
+                ),
+                PluginSetting(
+                    "auth-json", "Codex 인증 JSON",
+                    description = "선택 입력이에요. 비어 있으면 최초 요청 때 Termux의 ~/.codex/auth.json을 읽고 갱신 토큰을 이 프로필에 저장해요.",
+                    kind = PluginSettingKind.SECRET,
+                ),
+            ),
         ),
     )
 
-    override fun services(): List<PluginService> = listOf(CUSTOM_PROVIDER)
+    override fun services(host: PluginHost): List<PluginService> =
+        host.settingEntries(PROVIDERS_GROUP).map { entry ->
+            ProfileProvider(ProviderProfile(entry))
+        }
 
-    private object CUSTOM_PROVIDER : PluginAiProvider {
-        override val id = "custom-openai"
-        override val name = "사용자 지정 OpenAI"
-        override val description = "사용자가 지정한 OpenAI 호환 Chat Completions 서버"
-        override val defaultModel = "gpt-4.1-mini"
-        override val apiKeySetting = "api-key"
+    private inner class ProfileProvider(private val declared: ProviderProfile) : PluginAiProvider {
+        override val id = declared.id
+        override val name = declared.name
+        override val description = declared.type
+        override val defaultModel = declared.model
+        override val apiKeySetting: String? = null
 
         override fun open(host: PluginHost): PluginAiSession {
-            val endpoint = normalizeEndpoint(
-                host.setting("endpoint").orEmpty().trim().ifBlank { DEFAULT_ENDPOINT },
-            )
-            if (!isHttpsEndpoint(endpoint)) {
-                throw PluginAiException("endpoint는 사용자 정보가 없는 https:// 주소여야 해요.")
+            val entry = host.settingEntries(PROVIDERS_GROUP).firstOrNull { it.id == declared.id }
+                ?: throw PluginAiException("선택한 제공자 프로필이 삭제됐어요. 다른 프로필을 선택해 주세요.")
+            val profile = ProviderProfile(entry)
+            profile.validate()
+            return when (profile.type) {
+                CODEX_TYPE -> CodexSession(
+                    host, profile,
+                    codexAuth.getOrPut(profile.id) { CodexAuthStore() }.credentials(profile.authJson),
+                )
+                else -> CustomSession(host, profile)
             }
-            val key = host.setting("api-key").orEmpty().trim()
-            if (key.isEmpty()) throw PluginAiException("API 키를 먼저 저장해 주세요.")
-            return CustomSession(host, endpoint, key)
         }
     }
 
     private class CustomSession(
         private val host: PluginHost,
-        private val endpoint: String,
-        private val apiKey: String,
-    ) : PluginAiSession {
+        private val profile: ProviderProfile,
+    ) : RequestSession() {
+        private val endpoint = normalizeEndpoint(profile.endpoint)
         private val goSessionId: String? = if (isOpenCodeGoEndpoint(endpoint)) {
             val conversationId = host.aiConversationId
                 ?: throw PluginAiException("OpenCode Go에는 실제 AI 대화 ID가 필요해요. 대화가 연결된 Logent에서 실행해 주세요.")
@@ -105,9 +131,6 @@ class CustomOpenAiPlugin : LogentPlugin {
             ignoreUnknownKeys = true
             explicitNulls = false
         }
-        private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        @Volatile
-        private var activeRequest: Job? = null
 
         override suspend fun complete(request: PluginAiRequest): ChatResult = runRequest {
             completeOnce(request)
@@ -120,19 +143,6 @@ class CustomOpenAiPlugin : LogentPlugin {
             completeStreamingOnce(request, onEvent)
         }
 
-        override fun cancel() {
-            activeRequest?.cancel()
-        }
-
-        private suspend fun <T> runRequest(block: suspend () -> T): T {
-            val request = scope.async { block() }
-            activeRequest = request
-            return try {
-                request.await()
-            } finally {
-                if (activeRequest === request) activeRequest = null
-            }
-        }
 
         private suspend fun completeOnce(request: PluginAiRequest): ChatResult {
             val response = host.http(httpRequest(request, stream = false), protectedHeaders).getOrThrow()
@@ -161,13 +171,11 @@ class CustomOpenAiPlugin : LogentPlugin {
                 method = "POST",
                 url = endpoint,
                 headers = buildMap {
-                    put("Authorization", "Bearer $apiKey")
+                    if (profile.apiKey.isNotEmpty()) put("Authorization", "Bearer ${profile.apiKey}")
                     put("Content-Type", "application/json")
                     put("Accept", if (stream) "text/event-stream" else "application/json")
-                    if (goSessionId != null) {
-                        put(SESSION_HEADER, goSessionId)
-                        put("User-Agent", "Logent/${host.appVersion}")
-                    }
+                    put("User-Agent", "Logent/${host.appVersion}")
+                    if (goSessionId != null) put(SESSION_HEADER, goSessionId)
                 },
                 body = requestBody(request, stream).toString(),
                 timeoutSeconds = 120,
@@ -175,7 +183,7 @@ class CustomOpenAiPlugin : LogentPlugin {
             )
 
         private fun requestBody(request: PluginAiRequest, stream: Boolean): JsonObject = buildJsonObject {
-            put("model", request.model)
+            put("model", profile.model)
             put("stream", stream)
             put("messages", buildJsonArray {
                 request.messages.forEach { add(json.encodeToJsonElement(ApiMessage.serializer(), it)) }
@@ -191,6 +199,22 @@ class CustomOpenAiPlugin : LogentPlugin {
 
         private fun ensureSuccess(response: PluginHttpResponse) {
             if (response.status in 200..299) return
+            if (profile.type == NVIDIA_TYPE) {
+                val detail = errorMessage(response.body)
+                val message = when (response.status) {
+                    401 -> "NVIDIA API 키가 거부됐어요. build.nvidia.com에서 키를 다시 확인해 주세요."
+                    402 -> "NVIDIA 크레딧이 부족해요. build.nvidia.com에서 결제 정보를 확인해 주세요."
+                    403 -> "이 모델에 접근할 수 없어요. NVIDIA 계정의 모델 접근 권한을 확인해 주세요."
+                    404 -> "NVIDIA 모델 또는 엔드포인트를 찾을 수 없어요. 프로필의 모델 ID를 확인해 주세요."
+                    429 -> "NVIDIA 요청 한도를 초과했어요. 잠시 후 다시 시도해 주세요."
+                    in 500..599 -> "NVIDIA 서버 오류예요. 잠시 후 다시 시도해 주세요."
+                    else -> "NVIDIA 요청이 실패했어요. (HTTP ${response.status})"
+                }
+                throw PluginAiException(
+                    message + detail?.let { " · $it" }.orEmpty(),
+                    response.status, response.retryAfterSeconds(),
+                )
+            }
             val message = errorMessage(response.body) ?: "OpenAI 호환 서버가 ${response.status}로 응답했어요."
             val hint = if (response.status == 402 &&
                 message.contains("Insufficient account funds", ignoreCase = true) &&
@@ -203,7 +227,7 @@ class CustomOpenAiPlugin : LogentPlugin {
             } else {
                 ""
             }
-            throw PluginAiException(message + hint, response.status, response.headers["retry-after"]?.toLongOrNull())
+            throw PluginAiException(message + hint, response.status, response.retryAfterSeconds())
         }
 
         private fun parseCompletion(body: String): ChatResult {
@@ -345,7 +369,6 @@ class CustomOpenAiPlugin : LogentPlugin {
     }
 
     companion object {
-        private const val DEFAULT_ENDPOINT = "https://api.openai.com/v1/chat/completions"
         private const val SESSION_HEADER = "x-opencode-session"
         private fun isOpenCodeGoEndpoint(value: String): Boolean {
             val uri = URI(value)
@@ -388,9 +411,5 @@ class CustomOpenAiPlugin : LogentPlugin {
                 !path.startsWith("/inference/go/")
         }
 
-        private fun isHttpsEndpoint(value: String): Boolean = runCatching {
-            val uri = URI(value)
-            uri.scheme.equals("https", ignoreCase = true) && !uri.host.isNullOrBlank() && uri.userInfo == null
-        }.getOrDefault(false)
     }
 }

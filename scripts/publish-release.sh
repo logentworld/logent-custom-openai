@@ -15,7 +15,7 @@ if ! gh release view "$release" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; the
     # 동시 커밋이 먼저 만들었을 때도 이미 생긴 릴리스로 계속해요.
     # `HEAD` 문자열은 GitHub API가 커밋으로 해석하지 않아요. 현재 커밋 SHA를 고정해요.
     target="$(git rev-parse HEAD)"
-    gh release create "$release" --repo "$GITHUB_REPOSITORY" --target "$target" --title "사용자 지정 OpenAI $release" --notes "$notes" "${extra[@]}" ||
+    gh release create "$release" --repo "$GITHUB_REPOSITORY" --target "$target" --title "AI 제공자 $release" --notes "$notes" "${extra[@]}" ||
         gh release view "$release" --repo "$GITHUB_REPOSITORY" >/dev/null
 fi
 assets=(build/dist/logent-custom-openai-v"$version".aar build/dist/logent-custom-openai-v"$version"-assets-source.zip build/dist/SHA256SUMS build/dist/INSTALL-NOTE.txt)
