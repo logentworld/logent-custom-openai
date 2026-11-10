@@ -53,7 +53,28 @@ class CustomOpenAiPluginTest {
                 ),
             )
             assertEquals("완료", (result.message.content as JsonPrimitive).content)
+            assertEquals(null, host.lastHeaders["x-opencode-session"])
+            assertTrue(host.lastProtectedHeaders.isEmpty())
         }
+    }
+
+    @Test
+    fun `Zen Go 경로도 대화 헤더와 리다이렉트 보호를 선언해요`() = runBlocking {
+        val provider = CustomOpenAiPlugin().services().filterIsInstance<PluginAiProvider>().single()
+        val host = FakeHost(
+            mapOf(
+                "endpoint" to "https://opencode.ai/zen/go/v1/chat/completions",
+                "api-key" to "secret",
+            ),
+            aiConversationId = "session-zen",
+        )
+        val result = provider.open(host).complete(
+            PluginAiRequest("deepseek-v4.1-flash", listOf(ApiMessage("user", JsonPrimitive("hi")))),
+        )
+        assertEquals("완료", (result.message.content as JsonPrimitive).content)
+        assertEquals("session-zen", host.lastHeaders["x-opencode-session"])
+        assertTrue(host.lastHeaders["User-Agent"].orEmpty().startsWith("Logent/"))
+        assertEquals(setOf("x-opencode-session"), host.lastProtectedHeaders)
     }
 
     @Test
@@ -182,6 +203,8 @@ class CustomOpenAiPluginTest {
         override val aiConversationId: String? = null,
     ) : PluginHost {
         var lastBody: String? = null
+        var lastHeaders: Map<String, String> = emptyMap()
+        var lastProtectedHeaders: Set<String> = emptySet()
         override val appVersion = "test"
         override val apkPath = "/tmp/app.apk"
 
@@ -193,8 +216,33 @@ class CustomOpenAiPluginTest {
         override fun setting(key: String): String? = values[key]
         override fun progress(message: String) = Unit
 
-        override suspend fun http(request: PluginHttpRequest): Result<PluginHttpResponse> {
+        override suspend fun http(request: PluginHttpRequest): Result<PluginHttpResponse> = respond(request)
+
+        override suspend fun http(
+            request: PluginHttpRequest,
+            protectedHeaders: Set<String>,
+        ): Result<PluginHttpResponse> {
+            lastProtectedHeaders = protectedHeaders
+            return respond(request)
+        }
+
+        override suspend fun httpStream(
+            request: PluginHttpRequest,
+            onLine: (String) -> Unit,
+        ): Result<PluginHttpResponse> = respondStream(request, onLine)
+
+        override suspend fun httpStream(
+            request: PluginHttpRequest,
+            onLine: (String) -> Unit,
+            protectedHeaders: Set<String>,
+        ): Result<PluginHttpResponse> {
+            lastProtectedHeaders = protectedHeaders
+            return respondStream(request, onLine)
+        }
+
+        private fun respond(request: PluginHttpRequest): Result<PluginHttpResponse> {
             lastBody = request.body
+            lastHeaders = request.headers
             return Result.success(
                 PluginHttpResponse(
                     200,
@@ -204,11 +252,12 @@ class CustomOpenAiPluginTest {
             )
         }
 
-        override suspend fun httpStream(
+        private suspend fun respondStream(
             request: PluginHttpRequest,
             onLine: (String) -> Unit,
         ): Result<PluginHttpResponse> {
             lastBody = request.body
+            lastHeaders = request.headers
             if (streamDelayMs > 0) delay(streamDelayMs)
             if (streamBody.isNotEmpty()) return Result.success(PluginHttpResponse(200, emptyMap(), streamBody))
             streamLines.forEach(onLine)
