@@ -4,7 +4,7 @@ OpenAI 호환 Chat Completions 서버를 Logent의 AI 백엔드로 등록하는 
 
 ## 설정
 
-- `endpoint`: `https://`로 시작하는 Chat Completions 주소예요. 예: `https://api.openai.com/v1/chat/completions`
+- `endpoint`: `https://`로 시작하는 Chat Completions 주소예요. 예: `https://api.openai.com/v1/chat/completions`. `.../v1` 같은 base 주소도 받아 `/chat/completions`를 붙여요.
 - `API 키`: 플러그인 전용 저장소에만 보관해요.
 
 `endpoint`는 **설정 → 플러그인과 스킬 → 플러그인 관리 → 사용자 지정 OpenAI**의 플러그인 설정에서 바꿔요.
@@ -13,9 +13,9 @@ OpenAI 호환 Chat Completions 서버를 Logent의 AI 백엔드로 등록하는 
 
 ## OpenCode Go
 
-- `endpoint`에 전체 Chat Completions 주소를 넣어요.
-  - `https://opencode.ai/inference/go/openai/v1/chat/completions`
-  - `https://opencode.ai/zen/go/v1/chat/completions`
+- `endpoint`에 base 주소나 전체 Chat Completions 주소를 넣어요. base는 자동으로 `/chat/completions`가 붙어요.
+  - `https://opencode.ai/zen/go/v1` 또는 `https://opencode.ai/zen/go/v1/chat/completions`
+  - `https://opencode.ai/inference/go` 또는 `https://opencode.ai/inference/go/openai/v1/chat/completions`
 - Go를 구독한 워크스페이스의 기존 개인 API 키를 그대로 쓸 수 있어요. `Bearer` 없이 키 값만 저장하고, 키 권한의 **Models: Request**를 허용해요.
 - 모델은 `opencode-go/` 같은 접두사 없이 `deepseek-v4.1-flash`·`glm-5.3`·`kimi-k3`처럼 Go가 제공하는 ID를 입력해요.
 - 플러그인이 대화별 고정 `x-opencode-session`과 자체 `User-Agent`를 자동으로 보내요. 실제 대화 ID가 없거나 안전하지 않으면 전송 전에 오류를 알려줘요. 다른 endpoint에는 이 세션 헤더를 보내지 않아요.
