@@ -1,5 +1,6 @@
 package com.sleepysoong.logent.customopenai
 
+import com.sleepysoong.logent.plugin.PLUGIN_DERIVED_SETTINGS_API_VERSION
 import com.sleepysoong.logent.plugin.ApiFunctionCall
 import com.sleepysoong.logent.plugin.ApiMessage
 import com.sleepysoong.logent.plugin.ApiToolCall
@@ -11,6 +12,9 @@ import com.sleepysoong.logent.plugin.PluginAiProvider
 import com.sleepysoong.logent.plugin.PluginAiRequest
 import com.sleepysoong.logent.plugin.PluginAiSession
 import com.sleepysoong.logent.plugin.PluginAiStreamEvent
+import com.sleepysoong.logent.plugin.PluginDerivedSetting
+import com.sleepysoong.logent.plugin.PluginDerivedSettings
+import com.sleepysoong.logent.plugin.PluginDerivedSettingsHost
 import com.sleepysoong.logent.plugin.PluginHost
 import com.sleepysoong.logent.plugin.PluginHttpRequest
 import com.sleepysoong.logent.plugin.PluginHttpResponse
@@ -23,6 +27,16 @@ import com.sleepysoong.logent.plugin.ToolSpec
 import java.time.Instant
 import java.time.ZoneId
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -38,13 +52,17 @@ import kotlinx.serialization.json.put
  * 여러 OpenAI 호환·NVIDIA NIM·Codex 구독 프로필을 AI 제공자로 기여해요.
  * 인증과 모델은 프로필이 소유하며 모델 화면에서 키를 다시 입력하지 않아요.
  */
-class CustomOpenAiPlugin : LogentPlugin {
+class CustomOpenAiPlugin internal constructor(private val usageDispatcher: CoroutineDispatcher) :
+    LogentPlugin, PluginDerivedSettings {
+    constructor() : this(Dispatchers.IO)
     override val id = "com.sleepysoong.logent.custom-openai"
     override val name = "AI 제공자"
     override val version = BuildConfig.PLUGIN_VERSION
+    override val apiVersion = PLUGIN_DERIVED_SETTINGS_API_VERSION
 
     private val codexAuth = ConcurrentHashMap<String, CodexAuthStore>()
     private val usageCache = ConcurrentHashMap<String, CachedUsage>()
+    private val usageJobs = mutableMapOf<String, UsageJob>()
 
     override fun settingGroups() = listOf(
         PluginSettingGroup(
@@ -81,12 +99,17 @@ class CustomOpenAiPlugin : LogentPlugin {
                     description = "선택 입력이에요. 비어 있으면 최초 요청 때 Termux의 ~/.codex/auth.json을 읽고 갱신 토큰을 이 프로필에 저장해요.",
                     kind = PluginSettingKind.SECRET,
                 ),
-                PluginSetting(
-                    "usage", "OpenCode Go 사용량(자동)",
-                    description = "Go 프로필이면 대화를 실행할 때 5시간·주간·월간 남은 사용량을 플러그인이 자동으로 채워요. 직접 고칠 필요가 없어요.",
-                    kind = PluginSettingKind.TEXT,
-                ),
             ),
+        ),
+    )
+
+    override fun derivedSettings() = listOf(
+        PluginDerivedSetting(
+            groupKey = PROVIDERS_GROUP,
+            key = USAGE_KEY,
+            title = "OpenCode Go 사용량",
+            description = "Go 프로필의 5시간·주간·월간 남은 사용량과 리셋 시각이에요.",
+            dependencyKeys = USAGE_DEPENDENCIES,
         ),
     )
 
@@ -98,15 +121,11 @@ class CustomOpenAiPlugin : LogentPlugin {
     private inner class ProfileProvider(private val declared: ProviderProfile) : PluginAiProvider {
         override val id = declared.id
         override val name = declared.name
-        override val description: String
-            get() {
-                val usage = usageCache[declared.id]?.text ?: declared.usage
-                return listOf(declared.type, usage).filter { it.isNotBlank() }.joinToString(" · ")
-            }
+        // 사용량은 호스트 설정 목록이 파생 설정 스냅샷으로 보여 주므로 여기서는 종류만 표시해요.
+        override val description: String get() = declared.type
         override val defaultModel = declared.model
         override val apiKeySetting: String? = null
-        override val contextWindow: Int? =
-            if (declared.isOpenCodeGo) OpenCodeGo.contextWindow(declared.model) else null
+        override val contextWindow: Int? = null
         override val models: List<PluginAiModel> =
             if (declared.isOpenCodeGo) OpenCodeGo.models() else emptyList()
 
@@ -120,7 +139,7 @@ class CustomOpenAiPlugin : LogentPlugin {
                     host, profile,
                     codexAuth.getOrPut(profile.id) { CodexAuthStore() }.credentials(profile.authJson),
                 )
-                else -> CustomSession(host, profile)
+                else -> CustomSession(host, profile, entry)
             }
         }
     }
@@ -128,15 +147,36 @@ class CustomOpenAiPlugin : LogentPlugin {
     private inner class CustomSession(
         private val host: PluginHost,
         private val profile: ProviderProfile,
+        entry: PluginSettingEntry,
     ) : RequestSession() {
         private val endpoint = ProviderEndpoint.chatCompletions(profile.endpoint)
 
+        /** API 5 파생 설정을 지원하지 않는 호스트에서는 null이에요. */
+        private val derivedHost = host as? PluginDerivedSettingsHost
+
         /**
-         * Go는 대화마다 안정적인 세션 ID를 요구해요. 실제 대화 ID가 없는 호스트에서는
-         * 프로필별 고정 ID로 대체해, 요청을 보내기 전에 통째로 실패하지 않게 해요.
+         * open 시점의 사용량 파생 필드 revision이에요.
+         * 실행 시작에 고정한 필드 값과 같은 스냅샷에서만 캡처해, 그 사이 설정이 바뀌었으면
+         * 사용량 조회를 건너뛰어요. revision은 값 비교에만 쓰고 로그·문자열 표현에 남기지 않아요.
          */
+        private val usageRevision: String? = if (!profile.isOpenCodeGo) {
+            null
+        } else {
+            runCatching {
+                derivedHost?.derivedSettingSnapshots(PROVIDERS_GROUP)
+                    ?.firstOrNull { snapshot ->
+                        snapshot.entry.id == profile.id &&
+                            USAGE_DEPENDENCIES.all { key ->
+                                snapshot.entry.values[key].orEmpty() == entry.values[key].orEmpty()
+                            }
+                    }
+                    ?.revisions?.get(USAGE_KEY)
+            }.getOrNull()
+        }
+
+        /** Go는 호스트가 제공한 실제 대화 ID로 요청을 라우팅해요. */
         private val goSessionId: String? = if (profile.isOpenCodeGo) {
-            OpenCodeGo.sessionId(host.aiConversationId, profile.id, endpoint, profile.model)
+            OpenCodeGo.sessionId(host.aiConversationId)
         } else {
             null
         }
@@ -151,8 +191,8 @@ class CustomOpenAiPlugin : LogentPlugin {
 
         override suspend fun complete(request: PluginAiRequest): ChatResult = runRequest {
             val result = completeOnce(request)
-            // 사용량은 응답 뒤에 읽어요. 첫 응답을 기다리게 하지 않고, 실패해도 대화를 막지 않아요.
-            runCatching { refreshUsage() }
+            currentCoroutineContext().ensureActive()
+            scheduleUsage()
             result
         }
 
@@ -161,7 +201,8 @@ class CustomOpenAiPlugin : LogentPlugin {
             onEvent: (PluginAiStreamEvent) -> Unit,
         ): ChatResult = runRequest {
             val result = completeStreamingOnce(request, onEvent)
-            runCatching { refreshUsage() }
+            currentCoroutineContext().ensureActive()
+            scheduleUsage()
             result
         }
 
@@ -247,16 +288,73 @@ class CustomOpenAiPlugin : LogentPlugin {
         }
 
         /**
-         * Go 사용량을 조회해 프로필 설정 필드에 채워요.
-         *
-         * 사용량 조회 실패는 대화를 막지 않아요. 값은 잠깐 캐시해서 요청마다 서버를
-         * 부르지 않고, 마지막으로 읽은 요약을 설정 화면에 보여 줘요.
+         * 프로필마다 조회 하나와 마지막 대기 요청 하나만 유지해요. 취소된 연결이 실제로
+         * 끝난 뒤에만 대기 요청을 시작하며 대화는 조회를 기다리지 않아요.
          */
-        private suspend fun refreshUsage() {
+        private fun scheduleUsage() {
             if (!profile.isOpenCodeGo) return
-            val cached = usageCache[profile.id]
-            if (cached != null && cached.readAt.isAfter(Instant.now().minusSeconds(USAGE_CACHE_SECONDS))) return
-            val url = OpenCodeGo.usageUrl(endpoint) ?: return
+            val revision = usageRevision ?: return
+            val job = synchronized(usageJobs) {
+                // open 뒤에 일반 필드가 바뀌었으면 이 세션의 revision으로는 조회하지 않아요.
+                if (currentUsageRevision() != revision) return
+                val running = usageJobs[profile.id]
+                val cached = usageCache[profile.id]
+                if (cached != null && cached.revision == revision &&
+                    cached.readAt.isAfter(Instant.now().minusSeconds(USAGE_CACHE_SECONDS))
+                ) {
+                    running?.pending = null
+                    if (running != null && running.revision != revision) running.job.cancel()
+                    return
+                }
+                if (running != null) {
+                    if (running.revision == revision && running.job.isActive) {
+                        running.pending = null
+                    } else {
+                        running.pending = this
+                        running.job.cancel()
+                    }
+                    return
+                }
+                val task = CoroutineScope(usageDispatcher).launch(start = CoroutineStart.LAZY) {
+                    try {
+                        val updated = withTimeout(20_000) { refreshUsage(revision) }
+                        currentCoroutineContext().ensureActive()
+                        if (updated != null) usageCache[profile.id] = updated
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // 사용량 조회는 선택 사항이며 대화는 이미 성공했어요.
+                    }
+                }
+                val slot = UsageJob(revision, task)
+                usageJobs[profile.id] = slot
+                task.invokeOnCompletion {
+                    val pending = synchronized(usageJobs) {
+                        if (usageJobs[profile.id] === slot) {
+                            usageJobs.remove(profile.id)
+                            slot.pending
+                        } else {
+                            null
+                        }
+                    }
+                    pending?.scheduleUsage()
+                }
+                task
+            }
+            job.start()
+        }
+
+        /** 지금 호스트가 발급한 사용량 revision이에요. 항목이 없거나 미지원이면 null이에요. */
+        private fun currentUsageRevision(): String? = runCatching {
+            derivedHost?.derivedSettingSnapshots(PROVIDERS_GROUP)
+                ?.firstOrNull { it.entry.id == profile.id }
+                ?.revisions?.get(USAGE_KEY)
+        }.getOrNull()
+
+        private suspend fun refreshUsage(revision: String): CachedUsage? {
+            // 조회를 만들기 전과 보내기 직전에 revision이 그대로인지 확인해요.
+            if (currentUsageRevision() != revision) return null
+            val url = OpenCodeGo.usageUrl(endpoint) ?: return null
             val request = PluginHttpRequest(
                 method = "GET",
                 url = url,
@@ -268,24 +366,22 @@ class CustomOpenAiPlugin : LogentPlugin {
                 timeoutSeconds = 20,
                 maxResponseBytes = 64 * 1024,
             )
-            val response = host.http(request, emptySet()).getOrNull() ?: return
-            if (response.status !in 200..299) return
-            val usage = OpenCodeGo.parseUsage(response.body) ?: return
+            currentCoroutineContext().ensureActive()
+            if (currentUsageRevision() != revision) return null
+            val response = host.http(request, emptySet()).getOrThrow()
+            currentCoroutineContext().ensureActive()
+            if (response.status !in 200..299) return null
+            val usage = OpenCodeGo.parseUsage(response.body) ?: return null
             val text = OpenCodeGo.formatUsage(usage, ZoneId.systemDefault(), Instant.now())
-            usageCache[profile.id] = CachedUsage(Instant.now(), text)
-            if (text != profile.usage) writeUsage(text)
-        }
-
-        private fun writeUsage(text: String) {
-            val current = host.settingEntries(PROVIDERS_GROUP).firstOrNull { it.id == profile.id } ?: return
-            val name = current.values["name"].orEmpty()
-            if (name.isBlank()) return
-            val expected = mapOf("name" to name, "usage" to current.values["usage"].orEmpty())
-            host.writeSettingEntryIfUnchanged(
+            // revision이 바뀌었으면(설정 변경·삭제·재생성) 호스트가 false를 돌려줘요.
+            val written = derivedHost?.writeDerivedSettingIfCurrent(
                 PROVIDERS_GROUP,
-                PluginSettingEntry(profile.id, mapOf("name" to name, "usage" to text)),
-                expected,
-            )
+                profile.id,
+                USAGE_KEY,
+                revision,
+                text,
+            )?.getOrNull() == true
+            return if (written) CachedUsage(revision, Instant.now()) else null
         }
 
         private fun ensureSuccess(response: PluginHttpResponse, model: String) {
@@ -471,9 +567,23 @@ class CustomOpenAiPlugin : LogentPlugin {
         }
     }
 
-    private data class CachedUsage(val readAt: Instant, val text: String)
+    /**
+     * 60초 재사용 판단에 쓰는 값이에요.
+     * revision은 불투명 토큰이라 data class 문자열 표현에 노출되지 않도록 일반 클래스로 둬요.
+     */
+    private class CachedUsage(val revision: String, val readAt: Instant)
+
+    private class UsageJob(
+        val revision: String,
+        val job: Job,
+        var pending: CustomSession? = null,
+    )
 
     companion object {
         private const val USAGE_CACHE_SECONDS = 60L
+        private const val USAGE_KEY = "usage"
+
+        /** 사용량을 무효화해야 하는 같은 그룹의 일반 필드예요. */
+        private val USAGE_DEPENDENCIES = listOf("type", "endpoint", "model", "api-key")
     }
 }

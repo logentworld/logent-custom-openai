@@ -106,6 +106,7 @@ jobs:
           LOGENT_OPERATIONAL_SIGNING: ${{ steps.signing.outputs.signed }}
         run: ./scripts/build.sh -PlogentPluginApiMavenLocal=true
       - name: edge 릴리스에 .lpg를 올려요
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/logent' || startsWith(github.ref, 'refs/tags/v') }}
         env:
           GH_TOKEN: ${{ github.token }}
           SIGNED: ${{ steps.signing.outputs.signed }}

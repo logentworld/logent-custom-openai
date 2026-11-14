@@ -111,7 +111,7 @@ internal class CodexSession(
             }
         }
         return buildJsonObject {
-            put("model", profile.model)
+            put("model", request.model.trim().ifEmpty { profile.model })
             if (instructions.isNotEmpty()) put("instructions", instructions.toString())
             put("input", input)
             if (request.tools.isNotEmpty()) {
