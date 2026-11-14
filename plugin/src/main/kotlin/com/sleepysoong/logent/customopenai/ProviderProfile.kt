@@ -33,9 +33,24 @@ internal class ProviderProfile(entry: PluginSettingEntry) {
             ?: CODEX_ENDPOINT
         else -> configuredEndpoint.ifBlank { OPENAI_ENDPOINT }
     }
-    val model: String = when (type) {
-        NVIDIA_TYPE -> configuredModel.takeUnless { it.isBlank() || it == OPENAI_MODEL } ?: NVIDIA_MODEL
-        CODEX_TYPE -> configuredModel.takeUnless { it.isBlank() || it == OPENAI_MODEL } ?: CODEX_MODEL
+
+    /**
+     * 이 프로필이 OpenCode Go 구독 경로를 가리키는지 여부예요.
+     *
+     * Go는 모델 ID가 일반 OpenAI·NVIDIA와 다르고 세션 헤더·사용량 조회가 붙어서,
+     * endpoint만 보고 같은 판단을 여러 곳에서 되풀이하지 않도록 여기서 한 번 정해요.
+     */
+    val isOpenCodeGo: Boolean = type != CODEX_TYPE && OpenCodeGo.isEndpoint(ProviderEndpoint.chatCompletions(endpoint))
+
+    val model: String = when {
+        type == NVIDIA_TYPE -> configuredModel.takeUnless { it.isBlank() || it == OPENAI_MODEL }
+            ?: NVIDIA_MODEL
+        type == CODEX_TYPE -> configuredModel.takeUnless { it.isBlank() || it == OPENAI_MODEL }
+            ?: CODEX_MODEL
+        // Go에서는 폼 기본값인 OpenAI 모델을 Go 모델로 해석해요. 그대로 보내면 서버가
+        // "Model is unavailable"만 돌려주고 사용자는 원인을 알 수 없어요.
+        isOpenCodeGo -> configuredModel.takeUnless { it.isBlank() || it == OPENAI_MODEL }
+            ?: OpenCodeGo.DEFAULT_MODEL
         else -> configuredModel.ifBlank { OPENAI_MODEL }
     }
 
