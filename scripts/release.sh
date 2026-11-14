@@ -39,7 +39,7 @@ if git diff --cached --quiet; then echo "VERSION 변경 외에 커밋할 변경 
 git commit -m "$summary" -m "$body"
 git add VERSION
 git commit -m "chore(release): $next" -m "VERSION을 $next로 올리고 $tag 태그를 만들었어요."
-git tag -a "$tag" -m "Logent $tag"$'\n\n'"VERSION을 $next로 올린 릴리스예요."
+git tag -a "$tag" -m "$tag"$'\n\n'"VERSION을 $next로 올린 릴리스예요."
 trap - EXIT
 git push --atomic origin "HEAD:refs/heads/$branch" "refs/tags/$tag"
 ./scripts/publish-release.sh --built "$body"

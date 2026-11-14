@@ -20,5 +20,5 @@ if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
     gh release upload "$tag" "$asset" --repo "$repo" --clobber
     gh release edit "$tag" --repo "$repo" --notes "$notes"
 else
-    gh release create "$tag" "$asset" --repo "$repo" --verify-tag --title "$name $tag" --notes "$notes"
+    gh release create "$tag" "$asset" --repo "$repo" --verify-tag --title "$tag" --notes "$notes"
 fi

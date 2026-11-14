@@ -97,9 +97,9 @@ jobs:
           releases="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')"
           if ! grep -Fxq -- "$release" <<< "$releases"; then
             if [[ "$REF_TYPE" == "tag" ]]; then
-              gh release create "$release" --title "Logent plugin $release" --notes "태그 $release의 .lpg예요."
+              gh release create "$release" --title "$release" --notes "태그 $release의 .lpg예요."
             else
-              gh release create edge --prerelease --title 'Edge build' --notes '커밋마다 만드는 최신 .lpg예요.'
+              gh release create edge --prerelease --title 'edge' --notes '커밋마다 만드는 최신 .lpg예요.'
             fi
           fi
           existing="$(gh release view "$release" --json assets --jq '.assets[].name')"
