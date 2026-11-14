@@ -5,7 +5,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import java.net.URI
-import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
@@ -59,25 +58,18 @@ internal object OpenCodeGo {
         return "https://$authority$root/v1/usage"
     }
 
-    /**
-     * 호스트가 실제 AI 대화 ID를 주지 않을 때 쓰는 대체 세션 ID예요.
-     *
-     * Go는 요청마다 안정적인 세션 ID를 요구하지만, 값 자체는 라우팅·캐시 최적화에 쓰는
-     * 불투명한 문자열이에요. 그래서 대화 ID가 없는 구형 호스트에서는 프로필별로 같은
-     * 값을 유지해 요청이 통째로 막히지 않게 해요.
-     */
-    fun sessionId(conversationId: String?, profileId: String, endpoint: String, model: String): String {
-        val provided = conversationId.orEmpty()
-        if (provided.isNotEmpty() && provided.all { it in '!'..'~' }) return provided
-        val seed = "$profileId\u0000$endpoint\u0000$model"
-        val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray())
-        return "logent-" + digest.take(12).joinToString("") { "%02x".format(it) }
+    /** Go 세션은 실제 대화 ID만 사용하며 안전하지 않은 헤더 값은 거부해요. */
+    fun sessionId(conversationId: String?): String {
+        if (conversationId.isNullOrEmpty() || conversationId.any { it !in '!'..'~' }) {
+            throw com.sleepysoong.logent.plugin.PluginAiException(
+                "OpenCode Go에 유효한 대화 ID가 필요해요. 앱을 최신 Logent로 업데이트해 주세요.",
+            )
+        }
+        return conversationId
     }
 
     /** Go가 제공하는 모델 목록이에요. 마지막 실측 2026-11-14, `/inference/go/v1/models`. */
     fun models(): List<PluginAiModel> = MODELS
-
-    fun contextWindow(model: String): Int? = MODELS.firstOrNull { it.id == model }?.contextWindow
 
     /** `GET .../v1/usage` 응답을 읽어요. 형식이 다르면 null이에요. */
     fun parseUsage(body: String): Usage? {

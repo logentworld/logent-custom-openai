@@ -4,6 +4,6 @@
   "name": "AI 제공자",
   "entry": "com.sleepysoong.logent.customopenai.CustomOpenAiPlugin",
   "dependencies": [],
-  "apiMin": 4,
-  "apiMax": 4
+  "apiMin": 5,
+  "apiMax": 5
 }

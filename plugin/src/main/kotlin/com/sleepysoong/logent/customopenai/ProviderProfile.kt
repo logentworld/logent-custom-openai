@@ -22,8 +22,6 @@ internal class ProviderProfile(entry: PluginSettingEntry) {
     val type = entry.values["type"].orEmpty().ifBlank { OPENAI_TYPE }
     val apiKey = entry.values["api-key"].orEmpty().trim()
     val authJson = entry.values["auth-json"].orEmpty()
-    /** 플러그인이 Go 사용량을 채워 두는 표시용 필드예요. */
-    val usage = entry.values["usage"].orEmpty()
     private val configuredEndpoint = entry.values["endpoint"].orEmpty().trim()
     private val configuredModel = entry.values["model"].orEmpty().trim()
 
