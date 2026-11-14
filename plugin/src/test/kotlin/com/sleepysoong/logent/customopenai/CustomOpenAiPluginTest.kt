@@ -3,6 +3,7 @@ package com.sleepysoong.logent.customopenai
 import com.sleepysoong.logent.plugin.ApiFunctionCall
 import com.sleepysoong.logent.plugin.ApiMessage
 import com.sleepysoong.logent.plugin.ApiToolCall
+import com.sleepysoong.logent.plugin.FunctionSpec
 import com.sleepysoong.logent.plugin.PluginAiException
 import com.sleepysoong.logent.plugin.PluginAiProvider
 import com.sleepysoong.logent.plugin.PluginAiRequest
@@ -12,6 +13,7 @@ import com.sleepysoong.logent.plugin.PluginHttpRequest
 import com.sleepysoong.logent.plugin.PluginHttpResponse
 import com.sleepysoong.logent.plugin.PluginSettingEntry
 import com.sleepysoong.logent.plugin.ProcessResult
+import com.sleepysoong.logent.plugin.ToolSpec
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
@@ -22,6 +24,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -61,25 +64,148 @@ class CustomOpenAiPluginTest {
     }
 
     @Test
-    fun `Go base 주소는 실제 대화 ID를 보호하고 안전하지 않은 ID는 전송 전에 거부해요`() = runBlocking {
+    fun `Go base 주소는 실제 대화 ID를 세션 헤더로 보내고 사용량을 조회해요`() = runBlocking {
         for (base in listOf("https://opencode.ai/inference/go", "https://opencode.ai/zen/go/v1")) {
             val host = RecordingHost(profile("go", base, "go-key"), conversationId = "saved-session")
             providers(CustomOpenAiPlugin(), host).single().open(host).complete(request())
-            assertTrue(host.calls.single().url.endsWith("/v1/chat/completions"))
-            assertEquals(setOf("x-opencode-session"), host.protections.single())
-            assertEquals("saved-session", host.calls.single().headers["x-opencode-session"])
-            assertTrue(host.calls.single().headers["User-Agent"].orEmpty().startsWith("Logent/"))
-            for (unsafe in listOf(null, "", "한글", "session\r\nInjected: value", "session\u007f")) {
-                val rejected = RecordingHost(profile("go", base, "go-key"), conversationId = unsafe)
-                assertTrue(runCatching {
-                    providers(CustomOpenAiPlugin(), rejected).single().open(rejected)
-                }.exceptionOrNull() is PluginAiException)
-                assertTrue(rejected.calls.isEmpty())
-            }
+            val chat = host.calls.single { it.method == "POST" }
+            assertTrue(chat.url.endsWith("/v1/chat/completions"))
+            assertEquals(setOf("x-opencode-session"), host.protections[host.calls.indexOf(chat)])
+            assertEquals("saved-session", chat.headers["x-opencode-session"])
+            assertTrue(chat.headers["User-Agent"].orEmpty().startsWith("Logent/"))
+            val usage = host.calls.firstOrNull { it.method == "GET" }
+            assertTrue(usage != null && usage.url.endsWith("/v1/usage"))
         }
         val unrelated = RecordingHost(profile("other", "https://opencode.ai.example/inference/go/v1"))
         providers(CustomOpenAiPlugin(), unrelated).single().open(unrelated).complete(request())
         assertNull(unrelated.calls.single().headers["x-opencode-session"])
+    }
+
+    @Test
+    fun `대화 ID가 없거나 안전하지 않으면 프로필별 고정 세션 ID로 대체해요`() = runBlocking {
+        for (unsafe in listOf(null, "", "한글", "session\r\nInjected: value", "session\u007f")) {
+            val host = RecordingHost(profile("go", "https://opencode.ai/inference/go", "go-key"), conversationId = unsafe)
+            providers(CustomOpenAiPlugin(), host).single().open(host).complete(request())
+            val value = host.calls.single { it.method == "POST" }.headers["x-opencode-session"].orEmpty()
+            assertTrue(value.startsWith("logent-"))
+            assertTrue(value.all { it in '!'..'~' })
+        }
+        val first = RecordingHost(profile("one", "https://opencode.ai/inference/go", "go-key"))
+        val again = RecordingHost(profile("one", "https://opencode.ai/inference/go", "go-key"))
+        val other = RecordingHost(profile("two", "https://opencode.ai/inference/go", "go-key"))
+        listOf(first, again, other).forEach { host ->
+            providers(CustomOpenAiPlugin(), host).single().open(host).complete(request())
+        }
+        assertEquals(
+            first.calls.single { it.method == "POST" }.headers["x-opencode-session"],
+            again.calls.single { it.method == "POST" }.headers["x-opencode-session"],
+        )
+        assertFalse(
+            first.calls.single { it.method == "POST" }.headers["x-opencode-session"] ==
+                other.calls.single { it.method == "POST" }.headers["x-opencode-session"],
+        )
+    }
+
+    @Test
+    fun `Go 도구 정의는 type을 포함해 직렬화해요`() = runBlocking {
+        val host = RecordingHost(profile("go", "https://opencode.ai/inference/go", "go-key"), conversationId = "conv")
+        val tool = ToolSpec(
+            function = FunctionSpec(
+                name = "get_weather",
+                description = "도시 날씨를 알려 줘요.",
+                parameters = Json.parseToJsonElement("""{"type":"object","properties":{"city":{"type":"string"}}}""").jsonObject,
+            ),
+        )
+        providers(CustomOpenAiPlugin(), host).single().open(host).complete(
+            PluginAiRequest("", listOf(ApiMessage("user", JsonPrimitive("질문"))), listOf(tool)),
+        )
+        val sent = body(host.calls.single { it.method == "POST" })
+        val first = sent["tools"]!!.jsonArray.single().jsonObject
+        assertEquals("function", first["type"]!!.jsonPrimitive.content)
+        assertEquals("get_weather", first["function"]!!.jsonObject["name"]!!.jsonPrimitive.content)
+        assertEquals("auto", sent.stringValue("tool_choice"))
+    }
+
+    @Test
+    fun `Go 프로필은 OpenAI 기본 모델 대신 Go 모델을 쓰고 모델 목록을 알려 줘요`() = runBlocking {
+        val host = RecordingHost(
+            profile("go", "https://opencode.ai/inference/go", "go-key", OPENAI_MODEL),
+            conversationId = "conv",
+        )
+        val provider = providers(CustomOpenAiPlugin(), host).single()
+        assertEquals(OpenCodeGo.DEFAULT_MODEL, provider.defaultModel)
+        assertTrue(provider.models.any { it.id == OpenCodeGo.DEFAULT_MODEL })
+        assertEquals(1_000_000, provider.contextWindow)
+        provider.open(host).complete(PluginAiRequest(OPENAI_MODEL, listOf(ApiMessage("user", JsonPrimitive("질문")))))
+        assertEquals(OpenCodeGo.DEFAULT_MODEL, body(host.calls.single { it.method == "POST" }).stringValue("model"))
+        val plain = RecordingHost(profile("plain", "https://chat.example/v1", "key", "server-default"))
+        assertEquals(emptyList<String>(), providers(CustomOpenAiPlugin(), plain).single().models.map { it.id })
+    }
+
+    @Test
+    fun `모델 화면에서 고른 모델은 프로필 기본값을 덮어써요`() = runBlocking {
+        val host = RecordingHost(profile("go", "https://opencode.ai/inference/go", "go-key"), conversationId = "conv")
+        providers(CustomOpenAiPlugin(), host).single().open(host).complete(
+            PluginAiRequest("glm-5.3", listOf(ApiMessage("user", JsonPrimitive("질문")))),
+        )
+        assertEquals("glm-5.3", body(host.calls.single { it.method == "POST" }).stringValue("model"))
+        val plain = RecordingHost(profile("plain", "https://chat.example/v1", "key", "server-default"))
+        providers(CustomOpenAiPlugin(), plain).single().open(plain).complete(
+            PluginAiRequest("picked", listOf(ApiMessage("user", JsonPrimitive("질문")))),
+        )
+        assertEquals("picked", body(plain.calls.single { it.method == "POST" }).stringValue("model"))
+    }
+
+    @Test
+    fun `Go 사용량을 읽어 설정 필드에 남은 퍼센트로 기록해요`() = runBlocking {
+        val host = RecordingHost(profile("go", "https://opencode.ai/inference/go", "go-key"), conversationId = "conv")
+        host.httpHandler = { request ->
+            if (request.method == "GET") PluginHttpResponse(200, emptyMap(), USAGE_RESPONSE)
+            else PluginHttpResponse(200, emptyMap(), CHAT_RESPONSE)
+        }
+        val provider = providers(CustomOpenAiPlugin(), host).single()
+        provider.open(host).complete(request())
+        val stored = host.entries.getValue("go").values["usage"].orEmpty()
+        assertTrue(stored.contains("5시간 98% 남음"))
+        assertTrue(stored.contains("주간 70% 남음"))
+        assertTrue(stored.contains("월간 63% 남음"))
+        assertTrue(provider.description.contains("5시간 98% 남음"))
+        assertEquals(1, host.calls.count { it.method == "GET" })
+        // 캐시 안에서는 사용량을 다시 부르지 않아요.
+        provider.open(host).complete(request())
+        assertEquals(1, host.calls.count { it.method == "GET" })
+    }
+
+    @Test
+    fun `사용량 조회가 실패해도 대화와 저장된 값은 그대로예요`() = runBlocking {
+        val host = RecordingHost(profile("go", "https://opencode.ai/inference/go", "go-key"), conversationId = "conv")
+        host.httpHandler = { request ->
+            if (request.method == "GET") PluginHttpResponse(500, emptyMap(), "{}")
+            else PluginHttpResponse(200, emptyMap(), CHAT_RESPONSE)
+        }
+        providers(CustomOpenAiPlugin(), host).single().open(host).complete(request())
+        assertEquals("", host.entries.getValue("go").values["usage"].orEmpty())
+        assertEquals(0, host.successfulWrites)
+    }
+
+    @Test
+    fun `Go 모델·권한 오류는 원인과 해결책을 알려 줘요`() = runBlocking {
+        val cases = listOf(
+            Triple(400, """{"error":{"type":"server_error","message":"Upstream request failed: Model is unavailable."}}""", "deepseek-v4.1-flash"),
+            Triple(401, """{"error":{"message":"invalid api key"}}""", "API 키가 거부됐어요"),
+            Triple(403, """{"error":{"message":"forbidden"}}""", "Privacy"),
+            Triple(404, """{"error":{"message":"not found"}}""", "endpoint"),
+            Triple(429, """{"error":{"message":"rate limited"}}""", "한도를 초과했어요"),
+        )
+        for ((status, body, needle) in cases) {
+            val host = RecordingHost(profile("go", "https://opencode.ai/inference/go", "go-key"), conversationId = "conv")
+            host.httpHandler = { PluginHttpResponse(status, mapOf("Retry-After" to "2"), body) }
+            val failure = runCatching {
+                providers(CustomOpenAiPlugin(), host).single().open(host).complete(request())
+            }.exceptionOrNull() as PluginAiException
+            assertEquals(status, failure.status)
+            assertTrue(failure.message.orEmpty().contains(needle))
+        }
     }
 
     @Test
@@ -359,7 +485,7 @@ class CustomOpenAiPluginTest {
     }
 
     private fun providers(plugin: CustomOpenAiPlugin, host: PluginHost) = plugin.services(host).filterIsInstance<PluginAiProvider>()
-    private fun request() = PluginAiRequest("호출자가 바꾼 모델", listOf(ApiMessage("user", JsonPrimitive("질문"))))
+    private fun request() = PluginAiRequest("", listOf(ApiMessage("user", JsonPrimitive("질문"))))
     private fun body(request: PluginHttpRequest) = Json.parseToJsonElement(request.body!!).jsonObject
 
     private fun profile(
@@ -423,6 +549,7 @@ class CustomOpenAiPluginTest {
     }
 
     companion object {
+        private const val USAGE_RESPONSE = """{"usage":{"rolling":{"status":"ok","percent":2,"resetsAt":"2026-11-14T09:10:48.000Z"},"weekly":{"status":"ok","percent":30,"resetsAt":"2026-11-16T00:00:00.000Z"},"monthly":{"status":"ok","percent":37,"resetsAt":"2026-12-08T11:45:25.000Z"}}}"""
         private const val CHAT_RESPONSE = """{"choices":[{"message":{"role":"assistant","content":"완료"}}]}"""
         private const val CODEX_DONE = """{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"완료"}]}]}}"""
         private fun sse(emit: (String) -> Unit, vararg events: String): PluginHttpResponse {
