@@ -77,40 +77,11 @@ jobs:
         run: ./gradlew --no-daemon :plugin-api:publishToMavenLocal
       - name: 테스트와 lint를 실행해요
         run: ./scripts/test.sh -PlogentPluginApiMavenLocal=true
-      - name: 서명 키를 준비해요
-        id: signing
-        env:
-          CONTENT_SIGNING_KEY: ${{ secrets.LOGENT_CONTENT_SIGNING_KEY }}
-        run: |
-          set -euo pipefail
-          key="$RUNNER_TEMP/plugin-signing.pem"
-          public="$RUNNER_TEMP/plugin-signing-public.der"
-          umask 077
-          if [[ -n "${CONTENT_SIGNING_KEY:-}" ]]; then
-            printf '%s\n' "$CONTENT_SIGNING_KEY" > "$key"
-            echo 'signed=true' >> "$GITHUB_OUTPUT"
-          else
-            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-              -pkeyopt ec_param_enc:named_curve -out "$key"
-            echo 'signed=false' >> "$GITHUB_OUTPUT"
-          fi
-          openssl ec -in "$key" -pubout -outform DER -conv_form uncompressed \
-            -param_enc named_curve -out "$public" 2>/dev/null
-          echo "key=$key" >> "$GITHUB_OUTPUT"
-          echo "public=$public" >> "$GITHUB_OUTPUT"
-      - name: 서명된 .lpg를 빌드해요
-        env:
-          LOGENT_PLUGIN_SIGNING_KEY_FILE: ${{ steps.signing.outputs.key }}
-          LOGENT_CONTENT_SIGNING_KEY_FILE: ${{ steps.signing.outputs.key }}
-          LOGENT_PLUGIN_PUBLIC_KEY_FILE: ${{ steps.signing.outputs.public }}
-          LOGENT_OPERATIONAL_SIGNING: ${{ steps.signing.outputs.signed }}
-        run: ./scripts/build.sh -PlogentPluginApiMavenLocal=true
-      - name: edge 릴리스에 .lpg를 올려요
-        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/logent' || startsWith(github.ref, 'refs/tags/v') }}
+      - name: .lpg를 빌드해요
+        run: ./scripts/gradle.sh :plugin:pluginArtifacts -PlogentPluginApiMavenLocal=true
+      - name: 릴리스에 .lpg를 올려요
         env:
           GH_TOKEN: ${{ github.token }}
-          SIGNED: ${{ steps.signing.outputs.signed }}
-          COMMIT: ${{ github.sha }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
@@ -132,42 +103,18 @@ jobs:
             fi
           fi
           existing="$(gh release view "$release" --json assets --jq '.assets[].name')"
-          staging="$(mktemp -d)"
-          trap 'rm -rf "$staging"' EXIT
-          published=()
-          names=()
-          suffix="${COMMIT:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          for asset in "${assets[@]}"; do
-            base="${asset##*/}"
-            name="${base%.lpg}-${suffix}.lpg"
-            if [[ "$SIGNED" != true ]]; then name="${name%.lpg}-ci.lpg"; fi
-            cp -- "$asset" "$staging/$name"
-            published+=("$staging/$name")
-            names+=("$name")
-          done
-          checksum="$staging/SHA256SUMS-edge-${suffix}.txt"
-          (cd "$staging" && sha256sum -- "${names[@]}" > "$checksum")
-          gh release upload "$release" "${published[@]}" "$checksum"
-          if [[ "$SIGNED" == true ]]; then
-            note='운영 서명 키로 서명했어요. 앱에 설치할 수 있어요.'
-          else
-            note='CI 테스트 서명이라 앱에 설치할 수 없어요. LOGENT_CONTENT_SIGNING_KEY를 설정하면 설치 가능한 패키지로 바뀌어요.'
-          fi
-          printf -v asset_list '\n- %s' "${names[@]}"
-          note+=$'\n\n이번 실행에서 올린 패키지예요:'
-          note+="$asset_list"
-          note+=$'\n체크섬 파일: '
-          note+="${checksum##*/}"
-          if [[ "$REF_TYPE" == "tag" ]]; then
-            gh release edit "$release" --notes "태그 $release의 .lpg예요. $note"
-          else
-            gh release edit edge --prerelease --notes "커밋 ${COMMIT:0:7}의 .lpg예요. $note"
-          fi
+          gh release upload "$release" "${assets[@]}" --clobber
           while IFS= read -r old; do
-            # 같은 실행이 남긴 해시 이름의 .lpg와 체크섬만 지워요.
-            # 릴리스 스크립트가 올린 고정 이름의 운영 서명 패키지는 보존해요.
-            if [[ "$old" == SHA256SUMS.edge || "$old" == SHA256SUMS-edge-*.txt ]] ||
-              [[ "$old" =~ -[0-9a-f]{12}-[0-9]+-[0-9]+(-ci)?\.lpg$ ]]; then
-              gh release delete-asset "$release" "$old" -y
-            fi
+            [[ -z "$old" ]] && continue
+            keep=false
+            for asset in "${assets[@]}"; do
+              [[ "${asset##*/}" == "$old" ]] && keep=true
+            done
+            [[ "$keep" == true ]] && continue
+            gh release delete-asset "$release" "$old" -y
           done <<< "$existing"
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            gh release edit "$release" --notes "태그 $release의 .lpg예요."
+          else
+            gh release edit edge --prerelease --notes "커밋 ${GITHUB_SHA:0:7}의 .lpg예요."
+          fi

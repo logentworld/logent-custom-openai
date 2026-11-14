@@ -4,7 +4,7 @@ OpenAI 호환 서버·NVIDIA NIM·Codex 구독·OpenCode Go 구독을 여러 프
 
 ## 시작하기
 
-1. API **5.0.0**을 포함한 Logent에 서명된 `.lpg`를 설치해요.
+1. API **5.0.0**을 포함한 Logent에 `.lpg`를 설치해요.
 2. **설정 → 플러그인과 스킬 → 플러그인 관리 → AI 제공자 → 제공자 추가**에서 이름·종류·endpoint·모델·선택 인증을 저장해요. 프로필은 최대 32개까지 추가·수정·삭제할 수 있어요.
 3. 모델 설정에서 해당 프로필을 선택해요. 키와 기본 모델은 프로필에서 관리하며, 모델 화면에서 고른 모델이 있으면 그 값을 우선해요. 단, OpenCode Go에서 OpenAI 양식 기본값 `gpt-4.1-mini`는 선택하지 않은 값으로 취급해 프로필 모델을 써요.
 
@@ -68,8 +68,9 @@ Go 오류는 원인과 해결책을 함께 알려 줘요.
 프로덕션 의존성은 `plugin-api.lock`의 API `5.0.0` artifact뿐이에요. manifest의 `apiMin`·`apiMax`는 정수 major 계약인 `5`를 사용하며, 파생 설정·반복 설정·조건부 인증 저장에는 **5.0.0 이상** 호스트가 필요해요. 코어 내부 클래스·직접 HTTP 클라이언트를 사용하지 않고 공개 `PluginHost.http`·`httpStream`·설정 API와 `PluginDerivedSettingsHost`만 사용해요. 기존 단일 endpoint·키 설정이나 내장 NVIDIA·Codex 설정의 변환 경로는 제공하지 않아요.
 
 ```bash
-LOGENT_CONTENT_SIGNING_KEY_FILE="$HOME/.local/share/logent/content-signing.pem" \
-  ./scripts/build.sh -PlogentPluginApiMavenLocal=true
+./scripts/build.sh -PlogentPluginApiMavenLocal=true
 ```
+
+산출물은 `build/dist/logent-custom-openai-v<version>.lpg` 하나예요.
 
 기본은 고정 Maven artifact를 사용하고, 로컬 API 개발은 `-PlogentPluginApiSource=true` 또는 `-PlogentPluginApiMavenLocal=true`를 명시해요. 소비자 회귀 테스트는 `./scripts/test.sh -PlogentPluginApiSource=true`로 실행해요. 프로필 격리·인증 누락·안전한 세션 ID·SSE 완료·도구 스키마(`type` 포함)·Go 사용량 파생 값·revision 무효화·API 5 미지원 skip·모델 기본값·오류 문구·Codex 토큰 회전·늦은 저장·취소 경계만 검사하고 실제 유료 API는 호출하지 않아요. 스크린샷 테스트는 사용자가 명시적으로 요청할 때만 실행해요.

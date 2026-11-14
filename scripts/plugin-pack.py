@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AAR의 classes.jar를 D8로 바꾸고 서명된 `.lpg` 플러그인 패키지를 만들어요."""
+"""AAR의 classes.jar를 D8로 바꾸고 `.lpg` 플러그인 패키지를 만들어요."""
 
 import argparse
 import contextlib
@@ -26,7 +26,6 @@ MAX_TOTAL = 512 * 1024 * 1024
 MAX_AAR = 512 * 1024 * 1024
 MAX_AAR_ENTRIES = 16384
 MAX_CLASSES_JAR = 256 * 1024 * 1024
-MAX_SIGNATURE = 256
 MAX_ZIP = 512 * 1024 * 1024
 MAX_PATH = 1024
 CHUNK = 1024 * 1024
@@ -40,11 +39,6 @@ ENTRY_PATTERN = re.compile(
 SHA_PATTERN = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 DEX_MAGIC = b"dex\n"
 FORBIDDEN_ASSET_SUFFIXES = {".dex", ".apk", ".jar", ".class", ".aar", ".aab"}
-# id-ecPublicKey, prime256v1, 비압축 공개점으로 이루어진 DER SPKI 접두사예요.
-P256_SPKI_PREFIX = bytes.fromhex(
-    "3059301306072a8648ce3d020106082a8648ce3d03010703420004"
-)
-FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK
 
 
@@ -62,60 +56,12 @@ class FileEntry:
         self.size = size
 
 
-def openssl(*arguments, data=None, pass_fds=()):
-    result = subprocess.run(
-        ["openssl", *arguments], input=data, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, pass_fds=pass_fds, check=False,
-    )
-    if result.returncode:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise PackError(f"OpenSSL 실행에 실패했어요: {detail}")
-    return result.stdout
-
-
 def fingerprint(metadata):
     # ctime은 chmod로도 바뀌어 동시 패키징에서 오탐이 나요.
     return (
         metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
         metadata.st_mtime_ns,
     )
-
-
-def private_path(value):
-    path = Path(value).expanduser().resolve()
-    # worktree와 submodule의 .git 파일도 checkout 표시로 취급해요.
-    for parent in (path.parent, *path.parent.parents):
-        if os.path.lexists(parent / ".git"):
-            raise PackError(f"개인키를 Git checkout 안에 둘 수 없어요: {path}")
-    return path
-
-
-def public_der(private_bytes):
-    openssl("ec", "-check", "-noout", data=private_bytes)
-    public = openssl(
-        "ec", "-pubout", "-outform", "DER", "-conv_form", "uncompressed",
-        "-param_enc", "named_curve", data=private_bytes,
-    )
-    if len(public) != 91 or not public.startswith(P256_SPKI_PREFIX):
-        raise PackError("개인키는 ECDSA P-256 곡선을 사용해야 해요.")
-    return public
-
-
-def read_public_key(value):
-    path = Path(value).expanduser().absolute()
-    fd = os.open(path, READ_FLAGS)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise PackError("공개키는 일반 파일이어야 해요.")
-        with os.fdopen(fd, "rb") as stream:
-            fd = None
-            data = stream.read(4096)
-    finally:
-        if fd is not None:
-            os.close(fd)
-    if len(data) != 91 or not data.startswith(P256_SPKI_PREFIX):
-        raise PackError("공개키는 ECDSA P-256 DER SPKI여야 해요.")
-    return data
 
 
 def safe_path(value):
@@ -615,44 +561,13 @@ def render_manifest(arguments, files):
     return manifest
 
 
-def verify_signature(manifest, signature, public, workspace):
-    public_path = workspace / "verify-public.der"
-    signature_path = workspace / "verify-manifest.sig"
-    public_path.write_bytes(public)
-    signature_path.write_bytes(signature)
-    try:
-        openssl(
-            "dgst", "-sha256", "-verify", str(public_path), "-keyform", "DER",
-            "-signature", str(signature_path), data=manifest,
-        )
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            public_path.unlink()
-        with contextlib.suppress(FileNotFoundError):
-            signature_path.unlink()
-
-
-def sign_manifest(manifest, key_fd, public, workspace):
-    # 같은 파일 서술자를 OpenSSL에 넘겨 개인키가 읽는 중 바뀌지 않게 해요.
-    os.lseek(key_fd, 0, os.SEEK_SET)
-    signature = openssl(
-        "dgst", "-sha256", "-sign", f"/dev/fd/{key_fd}",
-        data=manifest, pass_fds=(key_fd,),
-    )
-    if not signature or len(signature) > MAX_SIGNATURE:
-        raise PackError("DER 서명은 1바이트 이상 256바이트 이하여야 해요.")
-    verify_signature(manifest, signature, public, workspace)
-    return signature
-
-
-def write_package(staged, files, manifest, signature):
-    total = len(manifest) + len(signature) + sum(entry.size for entry in files.values())
+def write_package(staged, files, manifest):
+    total = len(manifest) + sum(entry.size for entry in files.values())
     if total > MAX_TOTAL:
-        raise PackError("manifest와 서명을 포함한 전체 크기는 512MiB 이하여야 해요.")
+        raise PackError("manifest를 포함한 전체 크기는 512MiB 이하여야 해요.")
     with open(staged, "w+b") as stream:
         with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr(zip_info("manifest.txt"), manifest)
-            archive.writestr(zip_info("manifest.sig"), signature)
             for path in sorted(files):
                 entry = files[path]
                 with archive.open(zip_info(path), "w") as destination:
@@ -746,7 +661,7 @@ def parse_manifest(data):
     return files
 
 
-def verify_package(path, public, workspace):
+def verify_package(path, workspace):
     path = Path(path)
     if not path.is_file():
         raise PackError(f"완성된 패키지가 없어요: {path}")
@@ -772,22 +687,16 @@ def verify_package(path, public, workspace):
             if declared_total > MAX_TOTAL:
                 raise PackError("패키지 전체 크기가 너무 커요.")
             names.append(name)
-        if "manifest.txt" not in names or "manifest.sig" not in names:
-            raise PackError("패키지에 manifest.txt와 manifest.sig가 필요해요.")
+        if "manifest.txt" not in names:
+            raise PackError("패키지에 manifest.txt가 필요해요.")
         manifest = read_entry_bytes(
             archive, archive.getinfo("manifest.txt"), MAX_MANIFEST,
         )
-        signature = read_entry_bytes(
-            archive, archive.getinfo("manifest.sig"), MAX_SIGNATURE,
-        )
-        verify_signature(manifest, signature, public, workspace)
         parsed = parse_manifest(manifest)
-        expected = {"manifest.txt", "manifest.sig"} | {
-            entry.path for entry in parsed
-        }
+        expected = {"manifest.txt"} | {entry.path for entry in parsed}
         if set(names) != expected or len(names) != len(expected):
-            raise PackError("서명 목록과 패키지 ZIP 파일 목록이 달라요.")
-        actual_total = len(manifest) + len(signature)
+            raise PackError("manifest 목록과 패키지 ZIP 파일 목록이 달라요.")
+        actual_total = len(manifest)
         has_dex = False
         for entry in parsed:
             info = archive.getinfo(entry.path)
@@ -840,83 +749,50 @@ def build(arguments):
     if output.is_dir():
         raise PackError(f"출력 경로가 디렉터리예요: {output}")
     aar = Path(arguments.aar).expanduser().absolute()
-    key = private_path(arguments.key)
-    public_path = Path(arguments.public_key).expanduser().absolute()
-    if output.resolve() in (aar.resolve(), key, public_path.resolve()):
-        raise PackError("출력 경로는 AAR·개인키·공개키와 달라야 해요.")
+    if output.resolve() == aar.resolve():
+        raise PackError("출력 경로는 AAR과 달라야 해요.")
 
-    key_fd = os.open(key, FILE_FLAGS)
+    staging = Path(tempfile.mkdtemp(prefix=".logent-plugin-", dir=output.parent))
     try:
-        if not stat.S_ISREG(os.fstat(key_fd).st_mode):
-            raise PackError("개인키는 일반 파일이어야 해요.")
-        os.fchmod(key_fd, 0o600)
-        key_metadata = fingerprint(os.fstat(key_fd))
-        provided_public = read_public_key(public_path)
-        with os.fdopen(key_fd, "rb") as key_stream:
-            key_fd = None
-            private = key_stream.read(1024 * 1024 + 1)
-            if len(private) > 1024 * 1024:
-                raise PackError("개인키 파일은 1MiB 이하여야 해요.")
-            public = public_der(private)
-            if provided_public != public:
-                raise PackError("지정한 DER SPKI 공개키가 개인키와 일치하지 않아요.")
-            if fingerprint(os.fstat(key_stream.fileno())) != key_metadata:
-                raise PackError("개인키가 읽는 중 바뀌었어요.")
-
-            staging = Path(tempfile.mkdtemp(prefix=".logent-plugin-", dir=output.parent))
+        jar_path, files = read_aar(aar, arguments.id, staging)
+        d8, sdk_root = find_d8(arguments.d8)
+        java = find_java(arguments.java)
+        android_jar = find_android_jar(sdk_root)
+        files["classes.dex"] = d8_dex(
+            staging, d8, java, android_jar, jar_path, arguments.min_api,
+        )
+        manifest = render_manifest(arguments, files)
+        staged = staging / "package.lpg"
+        write_package(staged, files, manifest)
+        verify_package(staged, staging)
+        os.replace(staged, output)
+        try:
+            directory_fd = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
             try:
-                jar_path, files = read_aar(aar, arguments.id, staging)
-                d8, sdk_root = find_d8(arguments.d8)
-                java = find_java(arguments.java)
-                android_jar = find_android_jar(sdk_root)
-                files["classes.dex"] = d8_dex(
-                    staging, d8, java, android_jar, jar_path, arguments.min_api,
-                )
-                manifest = render_manifest(arguments, files)
-                # OpenSSL은 파일 서술자의 현재 위치를 쓰므로 방금 읽은 키를 되감아요.
-                key_stream.seek(0)
-                signature = sign_manifest(
-                    manifest, key_stream.fileno(), public, staging,
-                )
-                if fingerprint(os.fstat(key_stream.fileno())) != key_metadata:
-                    raise PackError("개인키가 서명 중 바뀌었어요.")
-                staged = staging / "package.lpg"
-                write_package(staged, files, manifest, signature)
-                verify_package(staged, public, staging)
-                os.replace(staged, output)
-                try:
-                    directory_fd = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
-                except OSError:
-                    directory_fd = None
-                if directory_fd is not None:
-                    try:
-                        with contextlib.suppress(OSError):
-                            os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
+                with contextlib.suppress(OSError):
+                    os.fsync(directory_fd)
             finally:
-                shutil.rmtree(staging, ignore_errors=True)
+                os.close(directory_fd)
     finally:
-        if key_fd is not None:
-            os.close(key_fd)
+        shutil.rmtree(staging, ignore_errors=True)
 
     dex = files["classes.dex"]
-    print(f"서명된 플러그인 패키지를 만들었어요: {output}")
+    print(f"플러그인 패키지를 만들었어요: {output}")
     print(f"id={arguments.id} short={short} files={len(files)} dex={dex.size}바이트")
-    print(f"공개키 SHA256: {hashlib.sha256(public).hexdigest()}")
 
 
 def parser():
     result = argparse.ArgumentParser(
-        description="AAR을 D8로 변환하고 서명된 .lpg 플러그인 패키지를 만들어요.",
+        description="AAR을 D8로 변환하고 .lpg 플러그인 패키지를 만들어요.",
     )
     commands = result.add_subparsers(dest="command", required=True, help="실행할 작업을 골라 주세요.")
-    package = commands.add_parser("build", help="AAR의 classes.jar와 자산을 서명 패키지로 만들어요.")
+    package = commands.add_parser("build", help="AAR의 classes.jar와 자산을 .lpg 패키지로 만들어요.")
     package.add_argument("--aar", required=True, help="Gradle이 만든 AAR 파일을 지정해 주세요.")
     package.add_argument("--definition", required=True, help="logent-plugin.json 정의 파일을 지정해 주세요.")
     package.add_argument("--version", required=True, help="플러그인 버전을 지정해 주세요.")
-    package.add_argument("--key", required=True, help="Git checkout 밖의 PEM 개인키를 지정해 주세요.")
-    package.add_argument("--public-key", required=True, help="개인키와 일치해야 하는 DER SPKI 공개키를 지정해 주세요.")
     package.add_argument("--output", required=True, help="완성된 .lpg 출력 경로를 지정해 주세요. 실패하면 기존 파일을 보존해요.")
     package.add_argument("--min-api", type=int, default=26, help="D8 Android min API예요. 기본값은 26이에요.")
     package.add_argument("--d8", help="Android SDK build-tools의 d8 실행 파일을 직접 지정해 주세요.")
