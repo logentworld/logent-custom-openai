@@ -6,6 +6,7 @@ import com.sleepysoong.logent.plugin.ApiToolCall
 import com.sleepysoong.logent.plugin.ChatResult
 import com.sleepysoong.logent.plugin.LogentPlugin
 import com.sleepysoong.logent.plugin.PluginAiException
+import com.sleepysoong.logent.plugin.PluginAiModel
 import com.sleepysoong.logent.plugin.PluginAiProvider
 import com.sleepysoong.logent.plugin.PluginAiRequest
 import com.sleepysoong.logent.plugin.PluginAiSession
@@ -14,12 +15,14 @@ import com.sleepysoong.logent.plugin.PluginHost
 import com.sleepysoong.logent.plugin.PluginHttpRequest
 import com.sleepysoong.logent.plugin.PluginHttpResponse
 import com.sleepysoong.logent.plugin.PluginSetting
+import com.sleepysoong.logent.plugin.PluginSettingEntry
 import com.sleepysoong.logent.plugin.PluginSettingGroup
 import com.sleepysoong.logent.plugin.PluginService
 import com.sleepysoong.logent.plugin.PluginSettingKind
 import com.sleepysoong.logent.plugin.ToolSpec
+import java.time.Instant
+import java.time.ZoneId
 import java.util.concurrent.ConcurrentHashMap
-import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -30,7 +33,6 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import java.net.URI
 
 /**
  * 여러 OpenAI 호환·NVIDIA NIM·Codex 구독 프로필을 AI 제공자로 기여해요.
@@ -42,6 +44,7 @@ class CustomOpenAiPlugin : LogentPlugin {
     override val version = BuildConfig.PLUGIN_VERSION
 
     private val codexAuth = ConcurrentHashMap<String, CodexAuthStore>()
+    private val usageCache = ConcurrentHashMap<String, CachedUsage>()
 
     override fun settingGroups() = listOf(
         PluginSettingGroup(
@@ -60,12 +63,12 @@ class CustomOpenAiPlugin : LogentPlugin {
                 ),
                 PluginSetting(
                     "endpoint", "Endpoint",
-                    description = "HTTPS base 또는 전체 요청 주소예요. NVIDIA·Codex에서는 비우거나 OpenAI 기본값을 두면 종류별 기본 주소를 써요.",
+                    description = "HTTPS base 또는 전체 요청 주소예요. NVIDIA·Codex에서는 비우거나 OpenAI 기본값을 두면 종류별 기본 주소를 써요. OpenCode Go는 https://opencode.ai/inference/go 또는 https://opencode.ai/zen/go/v1을 넣어요.",
                     defaultValue = OPENAI_ENDPOINT,
                 ),
                 PluginSetting(
                     "model", "모델",
-                    description = "이 프로필이 실행할 모델 ID예요. NVIDIA·Codex에서는 비우거나 OpenAI 기본값을 두면 종류별 기본 모델을 써요.",
+                    description = "이 프로필이 실행할 모델 ID예요. NVIDIA·Codex·OpenCode Go에서는 비우거나 OpenAI 기본값을 두면 종류별 기본 모델을 써요.",
                     defaultValue = OPENAI_MODEL,
                 ),
                 PluginSetting(
@@ -77,6 +80,11 @@ class CustomOpenAiPlugin : LogentPlugin {
                     "auth-json", "Codex 인증 JSON",
                     description = "선택 입력이에요. 비어 있으면 최초 요청 때 Termux의 ~/.codex/auth.json을 읽고 갱신 토큰을 이 프로필에 저장해요.",
                     kind = PluginSettingKind.SECRET,
+                ),
+                PluginSetting(
+                    "usage", "OpenCode Go 사용량(자동)",
+                    description = "Go 프로필이면 대화를 실행할 때 5시간·주간·월간 남은 사용량을 플러그인이 자동으로 채워요. 직접 고칠 필요가 없어요.",
+                    kind = PluginSettingKind.TEXT,
                 ),
             ),
         ),
@@ -90,9 +98,17 @@ class CustomOpenAiPlugin : LogentPlugin {
     private inner class ProfileProvider(private val declared: ProviderProfile) : PluginAiProvider {
         override val id = declared.id
         override val name = declared.name
-        override val description = declared.type
+        override val description: String
+            get() {
+                val usage = usageCache[declared.id]?.text ?: declared.usage
+                return listOf(declared.type, usage).filter { it.isNotBlank() }.joinToString(" · ")
+            }
         override val defaultModel = declared.model
         override val apiKeySetting: String? = null
+        override val contextWindow: Int? =
+            if (declared.isOpenCodeGo) OpenCodeGo.contextWindow(declared.model) else null
+        override val models: List<PluginAiModel> =
+            if (declared.isOpenCodeGo) OpenCodeGo.models() else emptyList()
 
         override fun open(host: PluginHost): PluginAiSession {
             val entry = host.settingEntries(PROVIDERS_GROUP).firstOrNull { it.id == declared.id }
@@ -109,44 +125,49 @@ class CustomOpenAiPlugin : LogentPlugin {
         }
     }
 
-    private class CustomSession(
+    private inner class CustomSession(
         private val host: PluginHost,
         private val profile: ProviderProfile,
     ) : RequestSession() {
-        private val endpoint = normalizeEndpoint(profile.endpoint)
-        private val goSessionId: String? = if (isOpenCodeGoEndpoint(endpoint)) {
-            val conversationId = host.aiConversationId
-                ?: throw PluginAiException("OpenCode Go에는 실제 AI 대화 ID가 필요해요. 대화가 연결된 Logent에서 실행해 주세요.")
-            if (conversationId.isEmpty() || conversationId.any { it !in '!'..'~' }) {
-                throw PluginAiException("OpenCode Go 대화 ID가 안전한 HTTP 헤더 값이 아니에요.")
-            }
-            conversationId
+        private val endpoint = ProviderEndpoint.chatCompletions(profile.endpoint)
+
+        /**
+         * Go는 대화마다 안정적인 세션 ID를 요구해요. 실제 대화 ID가 없는 호스트에서는
+         * 프로필별 고정 ID로 대체해, 요청을 보내기 전에 통째로 실패하지 않게 해요.
+         */
+        private val goSessionId: String? = if (profile.isOpenCodeGo) {
+            OpenCodeGo.sessionId(host.aiConversationId, profile.id, endpoint, profile.model)
         } else {
             null
         }
+
         /** 다른 출처로 리다이렉트될 때 대화 식별자를 넘기지 않도록 호스트에 직접 알려요. */
         private val protectedHeaders: Set<String> =
-            if (goSessionId == null) emptySet() else setOf(SESSION_HEADER)
+            if (goSessionId == null) emptySet() else setOf(OpenCodeGo.SESSION_HEADER)
         private val json = Json {
             ignoreUnknownKeys = true
             explicitNulls = false
         }
 
         override suspend fun complete(request: PluginAiRequest): ChatResult = runRequest {
-            completeOnce(request)
+            val result = completeOnce(request)
+            // 사용량은 응답 뒤에 읽어요. 첫 응답을 기다리게 하지 않고, 실패해도 대화를 막지 않아요.
+            runCatching { refreshUsage() }
+            result
         }
 
         override suspend fun completeStreaming(
             request: PluginAiRequest,
             onEvent: (PluginAiStreamEvent) -> Unit,
         ): ChatResult = runRequest {
-            completeStreamingOnce(request, onEvent)
+            val result = completeStreamingOnce(request, onEvent)
+            runCatching { refreshUsage() }
+            result
         }
-
 
         private suspend fun completeOnce(request: PluginAiRequest): ChatResult {
             val response = host.http(httpRequest(request, stream = false), protectedHeaders).getOrThrow()
-            ensureSuccess(response)
+            ensureSuccess(response, modelFor(request))
             return parseCompletion(response.body)
         }
 
@@ -160,11 +181,19 @@ class CustomOpenAiPlugin : LogentPlugin {
                 return completeOnce(request)
             }
             val response = result.getOrThrow()
-            ensureSuccess(response)
+            ensureSuccess(response, modelFor(request))
             // 일부 OpenAI 호환 서버는 stream:true를 무시하고 일반 JSON을 돌려줘요.
             if (!state.hasData && response.body.isNotBlank()) return parseCompletion(response.body)
             return state.finish()
         }
+
+        /**
+         * 모델은 프로필이 소유하지만, 사용자가 모델 화면에서 고른 값이 있으면 그 값을 써요.
+         * 폼 기본값인 OpenAI 모델은 "아직 고르지 않음"으로 보고 프로필 값으로 되돌려요.
+         */
+        private fun modelFor(request: PluginAiRequest): String =
+            request.model.trim().takeUnless { it.isEmpty() || (profile.isOpenCodeGo && it == OPENAI_MODEL) }
+                ?: profile.model
 
         private fun httpRequest(request: PluginAiRequest, stream: Boolean): PluginHttpRequest =
             PluginHttpRequest(
@@ -174,8 +203,8 @@ class CustomOpenAiPlugin : LogentPlugin {
                     if (profile.apiKey.isNotEmpty()) put("Authorization", "Bearer ${profile.apiKey}")
                     put("Content-Type", "application/json")
                     put("Accept", if (stream) "text/event-stream" else "application/json")
-                    put("User-Agent", "Logent/${host.appVersion}")
-                    if (goSessionId != null) put(SESSION_HEADER, goSessionId)
+                    put("User-Agent", "${OpenCodeGo.USER_AGENT}${host.appVersion}")
+                    if (goSessionId != null) put(OpenCodeGo.SESSION_HEADER, goSessionId)
                 },
                 body = requestBody(request, stream).toString(),
                 timeoutSeconds = 120,
@@ -183,13 +212,13 @@ class CustomOpenAiPlugin : LogentPlugin {
             )
 
         private fun requestBody(request: PluginAiRequest, stream: Boolean): JsonObject = buildJsonObject {
-            put("model", profile.model)
+            put("model", modelFor(request))
             put("stream", stream)
             put("messages", buildJsonArray {
                 request.messages.forEach { add(json.encodeToJsonElement(ApiMessage.serializer(), it)) }
             })
             if (request.tools.isNotEmpty()) {
-                put("tools", json.encodeToJsonElement(ListSerializer(ToolSpec.serializer()), request.tools))
+                put("tools", toolsJson(request.tools))
                 put("tool_choice", "auto")
             }
             if (stream) {
@@ -197,10 +226,72 @@ class CustomOpenAiPlugin : LogentPlugin {
             }
         }
 
-        private fun ensureSuccess(response: PluginHttpResponse) {
+        /**
+         * 도구 스키마는 `type`을 반드시 포함해요.
+         *
+         * kotlinx.serialization은 기본값을 생략하므로 [ToolSpec]을 그대로 직렬화하면
+         * `"type":"function"`이 빠지고, 게이트웨이는 그 배열을 도구가 아닌 값으로 보고
+         * 모델에 도구를 전혀 전달하지 않아요. 그래서 필수 필드를 직접 써요.
+         */
+        private fun toolsJson(tools: List<ToolSpec>): JsonArray = buildJsonArray {
+            tools.forEach { tool ->
+                add(buildJsonObject {
+                    put("type", tool.type.ifBlank { "function" })
+                    put("function", buildJsonObject {
+                        put("name", tool.function.name)
+                        put("description", tool.function.description)
+                        put("parameters", tool.function.parameters)
+                    })
+                })
+            }
+        }
+
+        /**
+         * Go 사용량을 조회해 프로필 설정 필드에 채워요.
+         *
+         * 사용량 조회 실패는 대화를 막지 않아요. 값은 잠깐 캐시해서 요청마다 서버를
+         * 부르지 않고, 마지막으로 읽은 요약을 설정 화면에 보여 줘요.
+         */
+        private suspend fun refreshUsage() {
+            if (!profile.isOpenCodeGo) return
+            val cached = usageCache[profile.id]
+            if (cached != null && cached.readAt.isAfter(Instant.now().minusSeconds(USAGE_CACHE_SECONDS))) return
+            val url = OpenCodeGo.usageUrl(endpoint) ?: return
+            val request = PluginHttpRequest(
+                method = "GET",
+                url = url,
+                headers = buildMap {
+                    if (profile.apiKey.isNotEmpty()) put("Authorization", "Bearer ${profile.apiKey}")
+                    put("Accept", "application/json")
+                    put("User-Agent", "${OpenCodeGo.USER_AGENT}${host.appVersion}")
+                },
+                timeoutSeconds = 20,
+                maxResponseBytes = 64 * 1024,
+            )
+            val response = host.http(request, emptySet()).getOrNull() ?: return
+            if (response.status !in 200..299) return
+            val usage = OpenCodeGo.parseUsage(response.body) ?: return
+            val text = OpenCodeGo.formatUsage(usage, ZoneId.systemDefault(), Instant.now())
+            usageCache[profile.id] = CachedUsage(Instant.now(), text)
+            if (text != profile.usage) writeUsage(text)
+        }
+
+        private fun writeUsage(text: String) {
+            val current = host.settingEntries(PROVIDERS_GROUP).firstOrNull { it.id == profile.id } ?: return
+            val name = current.values["name"].orEmpty()
+            if (name.isBlank()) return
+            val expected = mapOf("name" to name, "usage" to current.values["usage"].orEmpty())
+            host.writeSettingEntryIfUnchanged(
+                PROVIDERS_GROUP,
+                PluginSettingEntry(profile.id, mapOf("name" to name, "usage" to text)),
+                expected,
+            )
+        }
+
+        private fun ensureSuccess(response: PluginHttpResponse, model: String) {
             if (response.status in 200..299) return
+            val detail = errorMessage(response.body)
             if (profile.type == NVIDIA_TYPE) {
-                val detail = errorMessage(response.body)
                 val message = when (response.status) {
                     401 -> "NVIDIA API 키가 거부됐어요. build.nvidia.com에서 키를 다시 확인해 주세요."
                     402 -> "NVIDIA 크레딧이 부족해요. build.nvidia.com에서 결제 정보를 확인해 주세요."
@@ -215,10 +306,22 @@ class CustomOpenAiPlugin : LogentPlugin {
                     response.status, response.retryAfterSeconds(),
                 )
             }
-            val message = errorMessage(response.body) ?: "OpenAI 호환 서버가 ${response.status}로 응답했어요."
+            if (profile.isOpenCodeGo) {
+                val hint = OpenCodeGo.errorHint(response.status, detail, model)
+                val message = hint.ifBlank { detail ?: "OpenCode Go가 ${response.status}로 응답했어요." }
+                throw PluginAiException(
+                    if (detail != null && hint.isNotBlank() && !detail.contains("Model is unavailable")) {
+                        "$message · $detail"
+                    } else {
+                        message
+                    },
+                    response.status, response.retryAfterSeconds(),
+                )
+            }
+            val message = detail ?: "OpenAI 호환 서버가 ${response.status}로 응답했어요."
             val hint = if (response.status == 402 &&
                 message.contains("Insufficient account funds", ignoreCase = true) &&
-                isOpenCodePayAsYouGoEndpoint(endpoint)
+                OpenCodeGo.isPayAsYouGoEndpoint(endpoint)
             ) {
                 " OpenCode Go 구독은 일반 /inference 경로가 아니라 " +
                     "https://opencode.ai/inference/go/openai/v1/chat/completions 또는 " +
@@ -368,48 +471,9 @@ class CustomOpenAiPlugin : LogentPlugin {
         }
     }
 
+    private data class CachedUsage(val readAt: Instant, val text: String)
+
     companion object {
-        private const val SESSION_HEADER = "x-opencode-session"
-        private fun isOpenCodeGoEndpoint(value: String): Boolean {
-            val uri = URI(value)
-            if (!uri.scheme.equals("https", ignoreCase = true) ||
-                !uri.host.equals("opencode.ai", ignoreCase = true)
-            ) {
-                return false
-            }
-            val path = uri.rawPath.orEmpty()
-            return path.startsWith("/inference/go/") || path.startsWith("/zen/go/")
-        }
-
-        /**
-         * 다른 하네스가 쓰는 base URL을 Chat Completions 전체 주소로 맞춰요.
-         *
-         * 이미 전체 주소인 값과 쿼리가 붙은 값은 건드리지 않아요.
-         */
-        private fun normalizeEndpoint(value: String): String {
-            val uri = runCatching { URI(value) }.getOrNull() ?: return value
-            if (uri.rawQuery != null) return value
-            val path = uri.rawPath.orEmpty().trimEnd('/')
-            val suffix = when {
-                uri.host.equals("opencode.ai", ignoreCase = true) && path == "/inference/go" ->
-                    "/openai/v1/chat/completions"
-                uri.host.equals("opencode.ai", ignoreCase = true) && path == "/zen/go" ->
-                    "/v1/chat/completions"
-                path.endsWith("/v1") -> "/chat/completions"
-                else -> return value
-            }
-            return value.substringBefore('?').trimEnd('/') + suffix
-        }
-
-        /** OpenCode의 일반 과금 경로예요. Go 구독은 이 경로에 적용되지 않아요. */
-        private fun isOpenCodePayAsYouGoEndpoint(value: String): Boolean {
-            val uri = URI(value)
-            val path = uri.rawPath.orEmpty()
-            return uri.scheme.equals("https", ignoreCase = true) &&
-                uri.host.equals("opencode.ai", ignoreCase = true) &&
-                path.startsWith("/inference/") &&
-                !path.startsWith("/inference/go/")
-        }
-
+        private const val USAGE_CACHE_SECONDS = 60L
     }
 }
